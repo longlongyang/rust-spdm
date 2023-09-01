@@ -56,10 +56,11 @@ fn test_handle_get_encapsulated_request() {
             .spdm_encode(&mut context.common, &mut writer)
             .is_ok());
 
-        assert!(context
-            .handle_get_encapsulated_request(SESSION_ID, writer.used_slice())
-            .await
-            .is_ok());
+        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
+        let mut writer = Writer::init(&mut response_buffer);
+        let (status, buffer) = context
+        .handle_get_encapsulated_request(request, &mut writer);
+        assert!(status.is_ok());
 
         let receive = &mut [0u8; config::RECEIVER_BUFFER_SIZE];
         let receive_size = {
@@ -136,10 +137,11 @@ fn test_handle_deliver_encapsulated_reponse_digest() {
 
         assert!(write_spdm_get_digest_response(&mut context, &mut writer).is_ok());
 
-        assert!(context
-            .handle_deliver_encapsulated_reponse(SESSION_ID, request)
-            .await
-            .is_ok());
+        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
+        let mut writer = Writer::init(&mut response_buffer);
+        let (status, buffer) = context
+        .handle_deliver_encapsulated_reponse(request, &mut writer);
+        assert!(status.is_ok());
 
         // Get data sent by responder and decode the secured message
         let receive = &mut [0u8; config::RECEIVER_BUFFER_SIZE];
@@ -221,10 +223,11 @@ fn test_handle_deliver_encapsulated_reponse_cert() {
 
         assert!(write_spdm_get_certificate_response(&mut context, &mut writer).is_ok());
 
-        assert!(context
-            .handle_deliver_encapsulated_reponse(SESSION_ID, request)
-            .await
-            .is_ok());
+        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
+        let mut writer = Writer::init(&mut response_buffer);
+        let (status, send_buffer) = context
+            .handle_deliver_encapsulated_reponse(request, &mut writer);
+        assert!(status.is_ok());
 
         let receive: &mut [u8] = &mut [0u8; config::RECEIVER_BUFFER_SIZE];
         let receive_size = {

@@ -1,0 +1,3533 @@
+diff --git a/codec/src/codec.rs b/codec/src/codec.rs
+index 3f54e55..9b2eccc 100644
+--- a/codec/src/codec.rs
++++ b/codec/src/codec.rs
+@@ -109,6 +109,10 @@ impl<'a> Writer<'a> {
+     pub fn mut_used_slice(&mut self) -> &mut [u8] {
+         &mut self.buf[..self.offs]
+     }
++
++    pub fn clear(&mut self) {
++        self.offs = 0;
++    }
+ }
+ 
+ #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+diff --git a/external/ring b/external/ring
+--- a/external/ring
++++ b/external/ring
+@@ -1 +1 @@
+-Subproject commit 9cc0d45f4d8521f467bb3a621e74b1535e118188
++Subproject commit 9cc0d45f4d8521f467bb3a621e74b1535e118188-dirty
+diff --git a/external/webpki b/external/webpki
+--- a/external/webpki
++++ b/external/webpki
+@@ -1 +1 @@
+-Subproject commit 0b7cbf2d327d7665d9d06072bf46b2e7ca05f065
++Subproject commit 0b7cbf2d327d7665d9d06072bf46b2e7ca05f065-dirty
+diff --git a/spdmlib/src/responder/algorithm_rsp.rs b/spdmlib/src/responder/algorithm_rsp.rs
+index e4254cd..2ec44e1 100644
+--- a/spdmlib/src/responder/algorithm_rsp.rs
++++ b/spdmlib/src/responder/algorithm_rsp.rs
+@@ -2,38 +2,42 @@
+ //
+ // SPDX-License-Identifier: Apache-2.0
+ 
++use super::context::Reply;
+ use crate::common::SpdmCodec;
+ use crate::common::SpdmConnectionState;
+-use crate::error::SpdmResult;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::message::*;
+ use crate::protocol::*;
++use crate::responder::context::Reply::SendIt;
+ use crate::responder::*;
+ 
+ impl ResponderContext {
+-    pub async fn handle_spdm_algorithm(&mut self, bytes: &[u8]) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_algorithm(bytes, &mut writer);
+-        self.send_message(None, writer.used_slice(), false).await
++    pub fn handle_spdm_algorithm(
++        &mut self,
++        bytes: &[u8],
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_algorithm(bytes, &mut writer)
+     }
+ 
+-    pub fn write_spdm_algorithm(&mut self, bytes: &[u8], writer: &mut Writer) {
++    pub fn write_spdm_algorithm(&mut self, bytes: &[u8], writer: &mut Writer) -> Reply {
+         if self.common.runtime_info.get_connection_state()
+             != SpdmConnectionState::SpdmConnectionAfterCapabilities
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnexpectedRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         self.common.reset_buffer_via_request_code(
+@@ -70,7 +74,7 @@ impl ResponderContext {
+         } else {
+             error!("!!! negotiate_algorithms : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         if self
+@@ -79,7 +83,7 @@ impl ResponderContext {
+             .is_err()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         self.common
+@@ -118,7 +122,7 @@ impl ResponderContext {
+         //
+         if self.common.construct_my_cert_chain().is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         info!("send spdm algorithm\n");
+@@ -168,10 +172,12 @@ impl ResponderContext {
+         let res = response.spdm_encode(&mut self.common, writer);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         if self.common.append_message_a(writer.used_slice()).is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+         }
++
++        SendIt(writer.used())
+     }
+ }
+diff --git a/spdmlib/src/responder/app_message_handler.rs b/spdmlib/src/responder/app_message_handler.rs
+index 9c8310a..70a2dba 100644
+--- a/spdmlib/src/responder/app_message_handler.rs
++++ b/spdmlib/src/responder/app_message_handler.rs
+@@ -4,20 +4,21 @@
+ 
+ use conquer_once::spin::OnceCell;
+ 
++use super::context::Reply;
+ use crate::config::MAX_SPDM_MSG_SIZE;
+-use crate::error::SpdmResult;
+ use crate::responder::ResponderContext;
+ 
+-type SpdmAppMessageCbRes = ([u8; MAX_SPDM_MSG_SIZE], usize);
++type DispatchSecuredAppMessageCbType = fn(
++    ctx: &mut ResponderContext,
++    session_id: u32,
++    app_buffer: &[u8],
++    auxiliary_app_data: &[u8],
++    response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++) -> Reply;
+ 
+ #[derive(Clone)]
+ pub struct SpdmAppMessageHandler {
+-    pub dispatch_secured_app_message_cb: fn(
+-        ctx: &mut ResponderContext,
+-        session_id: u32,
+-        app_buffer: &[u8],
+-        auxiliary_app_data: &[u8],
+-    ) -> SpdmResult<SpdmAppMessageCbRes>,
++    pub dispatch_secured_app_message_cb: DispatchSecuredAppMessageCbType,
+ }
+ 
+ static SPDM_APP_MESSAGE_HANDLER: OnceCell<SpdmAppMessageHandler> = OnceCell::uninit();
+@@ -26,8 +27,9 @@ static DEFAULT: SpdmAppMessageHandler = SpdmAppMessageHandler {
+     dispatch_secured_app_message_cb: |_ctx: &mut ResponderContext,
+                                       _session_id: u32,
+                                       _app_buffer: &[u8],
+-                                      _auxiliary_app_data: &[u8]|
+-     -> SpdmResult<SpdmAppMessageCbRes> { unimplemented!() },
++                                      _auxiliary_app_data: &[u8],
++                                      _response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE]|
++     -> Reply { unimplemented!() },
+ };
+ 
+ #[allow(dead_code)]
+@@ -40,9 +42,16 @@ pub fn dispatch_secured_app_message_cb(
+     session_id: u32,
+     app_buffer: &[u8],
+     auxiliary_app_data: &[u8],
+-) -> SpdmResult<SpdmAppMessageCbRes> {
++    response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++) -> Reply {
+     (SPDM_APP_MESSAGE_HANDLER
+         .try_get_or_init(|| DEFAULT.clone())
+         .unwrap_or(&DEFAULT)
+-        .dispatch_secured_app_message_cb)(ctx, session_id, app_buffer, auxiliary_app_data)
++        .dispatch_secured_app_message_cb)(
++        ctx,
++        session_id,
++        app_buffer,
++        auxiliary_app_data,
++        response_buffer,
++    )
+ }
+diff --git a/spdmlib/src/responder/capability_rsp.rs b/spdmlib/src/responder/capability_rsp.rs
+index c4aba2a..53e35fa 100644
+--- a/spdmlib/src/responder/capability_rsp.rs
++++ b/spdmlib/src/responder/capability_rsp.rs
+@@ -4,25 +4,30 @@
+ 
+ use crate::common::SpdmCodec;
+ use crate::common::SpdmConnectionState;
+-use crate::error::SpdmResult;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::message::*;
+ use crate::protocol::*;
+ use crate::responder::*;
+ 
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
++
+ impl ResponderContext {
+-    pub async fn handle_spdm_capability(&mut self, bytes: &[u8]) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_capability_response(bytes, &mut writer);
+-        self.send_message(None, writer.used_slice(), false).await
++    pub fn handle_spdm_capability(
++        &mut self,
++        bytes: &[u8],
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_capability_response(bytes, &mut writer)
+     }
+ 
+-    pub fn write_spdm_capability_response(&mut self, bytes: &[u8], writer: &mut Writer) {
++    pub fn write_spdm_capability_response(&mut self, bytes: &[u8], writer: &mut Writer) -> Reply {
+         if self.common.runtime_info.get_connection_state()
+             != SpdmConnectionState::SpdmConnectionAfterVersion
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnexpectedRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+@@ -33,13 +38,13 @@ impl ResponderContext {
+         {
+             if version.get_u8() < SpdmVersion::SpdmVersion10.get_u8() {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+             self.common.negotiate_info.spdm_version_sel = version;
+         } else {
+             error!("!!! get_capabilities : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         self.common.reset_buffer_via_request_code(
+@@ -73,7 +78,7 @@ impl ResponderContext {
+         } else {
+             error!("!!! get_capabilities : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         if self
+@@ -82,7 +87,7 @@ impl ResponderContext {
+             .is_err()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         info!("send spdm capability\n");
+@@ -104,10 +109,12 @@ impl ResponderContext {
+         let res = response.spdm_encode(&mut self.common, writer);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         if self.common.append_message_a(writer.used_slice()).is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+         }
++
++        SendIt(writer.used())
+     }
+ }
+diff --git a/spdmlib/src/responder/certificate_rsp.rs b/spdmlib/src/responder/certificate_rsp.rs
+index 484b28f..2b4fd04 100644
+--- a/spdmlib/src/responder/certificate_rsp.rs
++++ b/spdmlib/src/responder/certificate_rsp.rs
+@@ -4,23 +4,23 @@
+ 
+ use crate::common::SpdmCodec;
+ use crate::common::SpdmConnectionState;
+-use crate::error::SpdmResult;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::message::*;
+ use crate::protocol::SPDM_MAX_SLOT_NUMBER;
+ use crate::responder::*;
+ 
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
++
+ impl ResponderContext {
+-    pub async fn handle_spdm_certificate(
++    pub fn handle_spdm_certificate(
+         &mut self,
+         bytes: &[u8],
+         session_id: Option<u32>,
+-    ) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_certificate_response(session_id, bytes, &mut writer);
+-
+-        self.send_message(session_id, writer.used_slice(), false)
+-            .await
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_certificate_response(session_id, bytes, &mut writer)
+     }
+ 
+     fn write_spdm_certificate_response(
+@@ -28,23 +28,23 @@ impl ResponderContext {
+         session_id: Option<u32>,
+         bytes: &[u8],
+         writer: &mut Writer,
+-    ) {
++    ) -> Reply {
+         if self.common.runtime_info.get_connection_state().get_u8()
+             < SpdmConnectionState::SpdmConnectionNegotiated.get_u8()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnexpectedRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         self.common.reset_buffer_via_request_code(
+@@ -58,12 +58,12 @@ impl ResponderContext {
+             debug!("!!! get_certificate : {:02x?}\n", get_certificate);
+             if get_certificate.slot_id != 0 {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             error!("!!! get_certificate : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         match session_id {
+@@ -74,7 +74,7 @@ impl ResponderContext {
+                     .is_err()
+                 {
+                     self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                    return;
++                    return SendIt(writer.used());
+                 }
+             }
+             Some(_session_id) => {}
+@@ -84,11 +84,11 @@ impl ResponderContext {
+         let slot_id = get_certificate.slot_id as usize;
+         if slot_id >= SPDM_MAX_SLOT_NUMBER {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         if self.common.provision_info.my_cert_chain[slot_id].is_none() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         let my_cert_chain = self.common.provision_info.my_cert_chain[slot_id]
+@@ -103,7 +103,7 @@ impl ResponderContext {
+         let offset = get_certificate.offset;
+         if offset > my_cert_chain.data_size {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         if length > my_cert_chain.data_size - offset {
+@@ -134,16 +134,13 @@ impl ResponderContext {
+         let res = response.spdm_encode(&mut self.common, writer);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+-        match session_id {
+-            None => {
+-                if self.common.append_message_b(writer.used_slice()).is_err() {
+-                    self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                }
+-            }
+-            Some(_session_id) => {}
++        if session_id.is_none() && self.common.append_message_b(writer.used_slice()).is_err() {
++            self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+         }
++
++        SendIt(writer.used())
+     }
+ }
+diff --git a/spdmlib/src/responder/challenge_rsp.rs b/spdmlib/src/responder/challenge_rsp.rs
+index c5c7040..0ac43c0 100644
+--- a/spdmlib/src/responder/challenge_rsp.rs
++++ b/spdmlib/src/responder/challenge_rsp.rs
+@@ -9,42 +9,51 @@ use crate::common::ManagedBuffer12Sign;
+ use crate::common::ManagedBufferM1M2;
+ use crate::common::SpdmCodec;
+ use crate::common::SpdmConnectionState;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::crypto;
+ use crate::error::SpdmResult;
+-use crate::message::*;
+-use crate::protocol::*;
+-use crate::responder::*;
+-extern crate alloc;
+ #[cfg(feature = "hashed-transcript-data")]
+ use crate::error::SPDM_STATUS_INVALID_STATE_LOCAL;
+ use crate::error::{SPDM_STATUS_BUFFER_FULL, SPDM_STATUS_CRYPTO_ERROR};
++use crate::message::*;
++use crate::protocol::*;
++use crate::responder::*;
+ use crate::secret;
+ 
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
++
+ impl ResponderContext {
+-    pub async fn handle_spdm_challenge(&mut self, bytes: &[u8]) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_challenge_response(bytes, &mut writer).await;
+-        self.send_message(None, writer.used_slice(), false).await
++    pub fn handle_spdm_challenge(
++        &mut self,
++        bytes: &[u8],
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_challenge_response(bytes, &mut writer)
+     }
+ 
+-    pub async fn write_spdm_challenge_response(&mut self, bytes: &[u8], writer: &mut Writer<'_>) {
++    pub fn write_spdm_challenge_response(
++        &mut self,
++        bytes: &[u8],
++        writer: &mut Writer<'_>,
++    ) -> Reply {
+         if self.common.runtime_info.get_connection_state().get_u8()
+             < SpdmConnectionState::SpdmConnectionNegotiated.get_u8()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnexpectedRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         self.common
+@@ -71,12 +80,12 @@ impl ResponderContext {
+                     );
+                 if measurement_summary_hash_res.is_none() {
+                     self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                    return;
++                    return SendIt(writer.used());
+                 }
+                 measurement_summary_hash = measurement_summary_hash_res.unwrap();
+                 if measurement_summary_hash.data_size == 0 {
+                     self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                    return;
++                    return SendIt(writer.used());
+                 }
+             } else {
+                 self.common.runtime_info.need_measurement_summary_hash = false;
+@@ -85,18 +94,18 @@ impl ResponderContext {
+         } else {
+             error!("!!! challenge : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         let challenge = challenge.unwrap();
+         let slot_id = challenge.slot_id as usize;
+         if slot_id >= SPDM_MAX_SLOT_NUMBER {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         if self.common.provision_info.my_cert_chain[slot_id].is_none() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         if self
+@@ -105,7 +114,7 @@ impl ResponderContext {
+             .is_err()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         let my_cert_chain = self.common.provision_info.my_cert_chain[slot_id]
+@@ -121,7 +130,7 @@ impl ResponderContext {
+         let res = crypto::rand::get_random(&mut nonce);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         info!("send spdm challenge_auth\n");
+@@ -153,7 +162,7 @@ impl ResponderContext {
+         let res = response.spdm_encode(&mut self.common, writer);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         let used = writer.used();
+ 
+@@ -167,14 +176,13 @@ impl ResponderContext {
+             .is_err()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         let signature = self.generate_challenge_auth_signature();
+         if signature.is_err() {
+-            self.send_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0)
+-                .await;
+-            return;
++            self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
++            return SendIt(writer.used());
+         }
+         let signature = signature.unwrap();
+         // patch the message before send
+@@ -182,6 +190,8 @@ impl ResponderContext {
+ 
+         self.common.reset_message_b();
+         self.common.reset_message_c();
++
++        SendIt(writer.used())
+     }
+ 
+     #[cfg(feature = "hashed-transcript-data")]
+diff --git a/spdmlib/src/responder/context.rs b/spdmlib/src/responder/context.rs
+index cd7047a..943df41 100644
+--- a/spdmlib/src/responder/context.rs
++++ b/spdmlib/src/responder/context.rs
+@@ -5,17 +5,64 @@
+ use super::app_message_handler::dispatch_secured_app_message_cb;
+ use crate::common::{session::SpdmSessionState, SpdmDeviceIo, SpdmTransportEncap};
+ use crate::common::{SpdmConnectionState, ST1};
+-use crate::config::{self, RECEIVER_BUFFER_SIZE};
+-use crate::error::{SpdmResult, SPDM_STATUS_UNSUPPORTED_CAP};
++use crate::config::{self, MAX_SPDM_MSG_SIZE, RECEIVER_BUFFER_SIZE};
++use crate::error::SpdmResult;
+ use crate::message::*;
+ use crate::protocol::{SpdmRequestCapabilityFlags, SpdmResponseCapabilityFlags};
+ use codec::{Codec, Reader, Writer};
+ extern crate alloc;
++use core::ops::ControlFlow;
+ use core::ops::DerefMut;
++use core::ops::FromResidual;
++use core::ops::Try;
+ 
+ use alloc::sync::Arc;
+ use spin::Mutex;
+ 
++pub enum Reply {
++    DropIt,
++    SendIt(usize),
++}
++
++impl Reply {
++    pub fn is_sendit(&self) -> bool {
++        match self {
++            DropIt => false,
++            SendIt(_) => true,
++        }
++    }
++
++    pub fn is_dropit(&self) -> bool {
++        !self.is_sendit()
++    }
++}
++
++impl FromResidual for Reply {
++    fn from_residual(r: <Reply as Try>::Residual) -> Self {
++        r
++    }
++}
++
++impl Try for Reply {
++    type Output = ();
++    type Residual = Self;
++
++    #[inline]
++    fn from_output(_: <Self as Try>::Output) -> Self {
++        DropIt
++    }
++
++    #[inline]
++    fn branch(self) -> ControlFlow<<Self as Try>::Residual, <Self as Try>::Output> {
++        match self {
++            DropIt => ControlFlow::Continue(()),
++            SendIt(v) => ControlFlow::Break(SendIt(v)),
++        }
++    }
++}
++
++pub use Reply::*;
++
+ pub struct ResponderContext {
+     pub common: crate::common::SpdmContext,
+ }
+@@ -148,6 +195,8 @@ impl ResponderContext {
+         auxiliary_app_data: &[u8],
+         raw_packet: &mut [u8; RECEIVER_BUFFER_SIZE],
+     ) -> Result<SpdmResult, usize> {
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
++
+         match self.receive_message(raw_packet, crypto_request).await {
+             Ok((used, secured_message)) => {
+                 if secured_message {
+@@ -184,25 +233,43 @@ impl ResponderContext {
+                         Err(_) => Err(used),
+                         Ok((decode_size, is_app_message)) => {
+                             if !is_app_message {
++                                if let SendIt(size) = self.dispatch_secured_message(
++                                    session_id,
++                                    &spdm_buffer[0..decode_size],
++                                    &mut response_buffer,
++                                ) {
++                                    Ok(self
++                                        .send_message(
++                                            Some(session_id),
++                                            &response_buffer[..size],
++                                            false,
++                                        )
++                                        .await)
++                                } else {
++                                    Ok(Ok(()))
++                                }
++                            } else if let SendIt(size) = self.dispatch_secured_app_message(
++                                session_id,
++                                &spdm_buffer[..decode_size],
++                                auxiliary_app_data,
++                                &mut response_buffer,
++                            ) {
+                                 Ok(self
+-                                    .dispatch_secured_message(
+-                                        session_id,
+-                                        &spdm_buffer[0..decode_size],
+-                                    )
++                                    .send_message(Some(session_id), &response_buffer[..size], true)
+                                     .await)
+                             } else {
+-                                Ok(self
+-                                    .dispatch_secured_app_message(
+-                                        session_id,
+-                                        &spdm_buffer[..decode_size],
+-                                        auxiliary_app_data,
+-                                    )
+-                                    .await)
++                                Ok(Ok(()))
+                             }
+                         }
+                     }
++                } else if let SendIt(size) =
++                    self.dispatch_message(&raw_packet[0..used], &mut response_buffer)
++                {
++                    Ok(self
++                        .send_message(None, &response_buffer[..size], false)
++                        .await)
+                 } else {
+-                    Ok(self.dispatch_message(&raw_packet[0..used]).await)
++                    Ok(Ok(()))
+                 }
+             }
+             Err(used) => Err(used),
+@@ -253,12 +320,18 @@ impl ResponderContext {
+         Ok((used, secured_message))
+     }
+ 
+-    async fn dispatch_secured_message(&mut self, session_id: u32, bytes: &[u8]) -> SpdmResult {
++    fn dispatch_secured_message(
++        &mut self,
++        session_id: u32,
++        bytes: &[u8],
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
+         let mut reader = Reader::init(bytes);
+ 
+         let session = self.common.get_immutable_session_via_id(session_id);
+         if session.is_none() {
+-            return Err(SPDM_STATUS_UNSUPPORTED_CAP);
++            log::error!("Session with id {:X?} not found", session_id);
++            return DropIt;
+         }
+         let session = session.unwrap();
+ 
+@@ -275,33 +348,34 @@ impl ResponderContext {
+                         .rsp_capabilities_sel
+                         .contains(SpdmResponseCapabilityFlags::HANDSHAKE_IN_THE_CLEAR_CAP);
+                 if in_clear_text {
+-                    return Err(SPDM_STATUS_UNSUPPORTED_CAP);
++                    log::error!("Doing handshaking in secured channel, while HANDSHAKE_IN_THE_CLEAR_CAP is set");
++                    return DropIt;
+                 }
+ 
+                 match SpdmMessageHeader::read(&mut reader) {
+                     Some(message_header) => match message_header.request_response_code {
+                         #[cfg(feature = "mut-auth")]
+                         SpdmRequestResponseCode::SpdmRequestGetEncapsulatedRequest => {
+-                            self.handle_get_encapsulated_request(session_id, bytes)
+-                                .await
++                            self.handle_get_encapsulated_request(bytes, response_buffer)
+                         }
+                         #[cfg(feature = "mut-auth")]
+                         SpdmRequestResponseCode::SpdmRequestDeliverEncapsulatedResponse => {
+-                            self.handle_deliver_encapsulated_reponse(session_id, bytes)
+-                                .await
++                            self.handle_deliver_encapsulated_reponse(bytes, response_buffer)
+                         }
+                         SpdmRequestResponseCode::SpdmRequestFinish => {
+-                            self.handle_spdm_finish(session_id, bytes).await
++                            self.handle_spdm_finish(session_id, bytes, response_buffer)
+                         }
+ 
+                         SpdmRequestResponseCode::SpdmRequestPskFinish => {
+-                            self.handle_spdm_psk_finish(session_id, bytes).await
++                            self.handle_spdm_psk_finish(session_id, bytes, response_buffer)
+                         }
+ 
+-                        SpdmRequestResponseCode::SpdmRequestVendorDefinedRequest => {
+-                            self.handle_spdm_vendor_defined_request(Some(session_id), bytes)
+-                                .await
+-                        }
++                        SpdmRequestResponseCode::SpdmRequestVendorDefinedRequest => self
++                            .handle_spdm_vendor_defined_request(
++                                Some(session_id),
++                                bytes,
++                                response_buffer,
++                            ),
+ 
+                         SpdmRequestResponseCode::SpdmRequestGetVersion
+                         | SpdmRequestResponseCode::SpdmRequestGetCapabilities
+@@ -314,143 +388,144 @@ impl ResponderContext {
+                         | SpdmRequestResponseCode::SpdmRequestPskExchange
+                         | SpdmRequestResponseCode::SpdmRequestHeartbeat
+                         | SpdmRequestResponseCode::SpdmRequestKeyUpdate
+-                        | SpdmRequestResponseCode::SpdmRequestEndSession => {
+-                            self.handle_error_request(
++                        | SpdmRequestResponseCode::SpdmRequestEndSession => self
++                            .handle_error_request(
+                                 SpdmErrorCode::SpdmErrorUnexpectedRequest,
+-                                Some(session_id),
+                                 bytes,
+-                            )
+-                            .await
+-                        }
++                                response_buffer,
++                            ),
+ 
+-                        SpdmRequestResponseCode::SpdmRequestResponseIfReady => {
+-                            self.handle_error_request(
++                        SpdmRequestResponseCode::SpdmRequestResponseIfReady => self
++                            .handle_error_request(
+                                 SpdmErrorCode::SpdmErrorUnsupportedRequest,
+-                                Some(session_id),
+                                 bytes,
+-                            )
+-                            .await
+-                        }
++                                response_buffer,
++                            ),
+ 
+-                        _ => Err(SPDM_STATUS_UNSUPPORTED_CAP),
++                        _ => DropIt,
+                     },
+-                    None => Err(SPDM_STATUS_UNSUPPORTED_CAP),
++                    None => DropIt,
+                 }
+             }
+             SpdmSessionState::SpdmSessionEstablished => {
+                 match SpdmMessageHeader::read(&mut reader) {
+-                    Some(message_header) => match message_header.request_response_code {
+-                        SpdmRequestResponseCode::SpdmRequestGetDigests => {
+-                            self.handle_spdm_digest(bytes, Some(session_id)).await
+-                        }
+-                        SpdmRequestResponseCode::SpdmRequestGetCertificate => {
+-                            self.handle_spdm_certificate(bytes, Some(session_id)).await
+-                        }
+-                        SpdmRequestResponseCode::SpdmRequestGetMeasurements => {
+-                            self.handle_spdm_measurement(Some(session_id), bytes).await
+-                        }
+-
+-                        SpdmRequestResponseCode::SpdmRequestHeartbeat => {
+-                            self.handle_spdm_heartbeat(session_id, bytes).await
+-                        }
+-
+-                        SpdmRequestResponseCode::SpdmRequestKeyUpdate => {
+-                            self.handle_spdm_key_update(session_id, bytes).await
+-                        }
++                    Some(message_header) => {
++                        match message_header.request_response_code {
++                            SpdmRequestResponseCode::SpdmRequestGetDigests => {
++                                self.handle_spdm_digest(bytes, Some(session_id), response_buffer)
++                            }
++                            SpdmRequestResponseCode::SpdmRequestGetCertificate => self
++                                .handle_spdm_certificate(bytes, Some(session_id), response_buffer),
++                            SpdmRequestResponseCode::SpdmRequestGetMeasurements => self
++                                .handle_spdm_measurement(Some(session_id), bytes, response_buffer),
+ 
+-                        SpdmRequestResponseCode::SpdmRequestEndSession => {
+-                            self.handle_spdm_end_session(session_id, bytes).await
+-                        }
+-                        SpdmRequestResponseCode::SpdmRequestVendorDefinedRequest => {
+-                            self.handle_spdm_vendor_defined_request(Some(session_id), bytes)
+-                                .await
+-                        }
++                            SpdmRequestResponseCode::SpdmRequestHeartbeat => {
++                                self.handle_spdm_heartbeat(session_id, bytes, response_buffer)
++                            }
+ 
+-                        SpdmRequestResponseCode::SpdmRequestGetVersion
+-                        | SpdmRequestResponseCode::SpdmRequestGetCapabilities
+-                        | SpdmRequestResponseCode::SpdmRequestNegotiateAlgorithms
+-                        | SpdmRequestResponseCode::SpdmRequestChallenge
+-                        | SpdmRequestResponseCode::SpdmRequestKeyExchange
+-                        | SpdmRequestResponseCode::SpdmRequestPskExchange
+-                        | SpdmRequestResponseCode::SpdmRequestFinish
+-                        | SpdmRequestResponseCode::SpdmRequestPskFinish => {
+-                            self.handle_error_request(
+-                                SpdmErrorCode::SpdmErrorUnexpectedRequest,
+-                                Some(session_id),
+-                                bytes,
+-                            )
+-                            .await
+-                        }
++                            SpdmRequestResponseCode::SpdmRequestKeyUpdate => {
++                                self.handle_spdm_key_update(session_id, bytes, response_buffer)
++                            }
+ 
+-                        SpdmRequestResponseCode::SpdmRequestResponseIfReady => {
+-                            self.handle_error_request(
+-                                SpdmErrorCode::SpdmErrorUnsupportedRequest,
+-                                Some(session_id),
+-                                bytes,
+-                            )
+-                            .await
++                            SpdmRequestResponseCode::SpdmRequestEndSession => {
++                                self.handle_spdm_end_session(session_id, bytes, response_buffer)
++                            }
++                            SpdmRequestResponseCode::SpdmRequestVendorDefinedRequest => self
++                                .handle_spdm_vendor_defined_request(
++                                    Some(session_id),
++                                    bytes,
++                                    response_buffer,
++                                ),
++
++                            SpdmRequestResponseCode::SpdmRequestGetVersion
++                            | SpdmRequestResponseCode::SpdmRequestGetCapabilities
++                            | SpdmRequestResponseCode::SpdmRequestNegotiateAlgorithms
++                            | SpdmRequestResponseCode::SpdmRequestChallenge
++                            | SpdmRequestResponseCode::SpdmRequestKeyExchange
++                            | SpdmRequestResponseCode::SpdmRequestPskExchange
++                            | SpdmRequestResponseCode::SpdmRequestFinish
++                            | SpdmRequestResponseCode::SpdmRequestPskFinish => self
++                                .handle_error_request(
++                                    SpdmErrorCode::SpdmErrorUnexpectedRequest,
++                                    bytes,
++                                    response_buffer,
++                                ),
++
++                            SpdmRequestResponseCode::SpdmRequestResponseIfReady => self
++                                .handle_error_request(
++                                    SpdmErrorCode::SpdmErrorUnsupportedRequest,
++                                    bytes,
++                                    response_buffer,
++                                ),
++
++                            _ => DropIt,
+                         }
+-
+-                        _ => Err(SPDM_STATUS_UNSUPPORTED_CAP),
+-                    },
+-                    None => Err(SPDM_STATUS_UNSUPPORTED_CAP),
++                    }
++                    None => DropIt,
+                 }
+             }
+-            SpdmSessionState::SpdmSessionNotStarted => Err(SPDM_STATUS_UNSUPPORTED_CAP),
+-            SpdmSessionState::Unknown(_) => Err(SPDM_STATUS_UNSUPPORTED_CAP),
++            SpdmSessionState::SpdmSessionNotStarted => DropIt,
++            SpdmSessionState::Unknown(_) => DropIt,
+         }
+     }
+ 
+-    async fn dispatch_secured_app_message(
++    fn dispatch_secured_app_message(
+         &mut self,
+         session_id: u32,
+         bytes: &[u8],
+         auxiliary_app_data: &[u8],
+-    ) -> SpdmResult {
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
+         debug!("dispatching secured app message\n");
+-
+-        let (rsp_app_buffer, size) =
+-            dispatch_secured_app_message_cb(self, session_id, bytes, auxiliary_app_data).unwrap();
+-        self.send_message(Some(session_id), &rsp_app_buffer[..size], true)
+-            .await
++        dispatch_secured_app_message_cb(
++            self,
++            session_id,
++            bytes,
++            auxiliary_app_data,
++            response_buffer,
++        )
+     }
+ 
+-    pub async fn dispatch_message(&mut self, bytes: &[u8]) -> SpdmResult {
++    pub fn dispatch_message(
++        &mut self,
++        bytes: &[u8],
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
+         let mut reader = Reader::init(bytes);
+         match SpdmMessageHeader::read(&mut reader) {
+             Some(message_header) => match message_header.request_response_code {
+                 SpdmRequestResponseCode::SpdmRequestGetVersion => {
+-                    self.handle_spdm_version(bytes).await
++                    self.handle_spdm_version(bytes, response_buffer)
+                 }
+                 SpdmRequestResponseCode::SpdmRequestGetCapabilities => {
+-                    self.handle_spdm_capability(bytes).await
++                    self.handle_spdm_capability(bytes, response_buffer)
+                 }
+                 SpdmRequestResponseCode::SpdmRequestNegotiateAlgorithms => {
+-                    self.handle_spdm_algorithm(bytes).await
++                    self.handle_spdm_algorithm(bytes, response_buffer)
+                 }
+                 SpdmRequestResponseCode::SpdmRequestGetDigests => {
+-                    self.handle_spdm_digest(bytes, None).await
++                    self.handle_spdm_digest(bytes, None, response_buffer)
+                 }
+                 SpdmRequestResponseCode::SpdmRequestGetCertificate => {
+-                    self.handle_spdm_certificate(bytes, None).await
++                    self.handle_spdm_certificate(bytes, None, response_buffer)
+                 }
+                 SpdmRequestResponseCode::SpdmRequestChallenge => {
+-                    self.handle_spdm_challenge(bytes).await
++                    self.handle_spdm_challenge(bytes, response_buffer)
+                 }
+                 SpdmRequestResponseCode::SpdmRequestGetMeasurements => {
+-                    self.handle_spdm_measurement(None, bytes).await
++                    self.handle_spdm_measurement(None, bytes, response_buffer)
+                 }
+ 
+                 SpdmRequestResponseCode::SpdmRequestKeyExchange => {
+-                    self.handle_spdm_key_exchange(bytes).await
++                    self.handle_spdm_key_exchange(bytes, response_buffer)
+                 }
+ 
+                 SpdmRequestResponseCode::SpdmRequestPskExchange => {
+-                    self.handle_spdm_psk_exchange(bytes).await
++                    self.handle_spdm_psk_exchange(bytes, response_buffer)
+                 }
+ 
+                 SpdmRequestResponseCode::SpdmRequestVendorDefinedRequest => {
+-                    self.handle_spdm_vendor_defined_request(None, bytes).await
++                    self.handle_spdm_vendor_defined_request(None, bytes, response_buffer)
+                 }
+ 
+                 SpdmRequestResponseCode::SpdmRequestFinish => {
+@@ -472,7 +547,11 @@ impl ResponderContext {
+                                 if session.get_session_state()
+                                     == SpdmSessionState::SpdmSessionHandshaking
+                                 {
+-                                    return self.handle_spdm_finish(session_id, bytes).await;
++                                    return self.handle_spdm_finish(
++                                        session_id,
++                                        bytes,
++                                        response_buffer,
++                                    );
+                                 }
+                             }
+                         }
+@@ -480,36 +559,29 @@ impl ResponderContext {
+ 
+                     self.handle_error_request(
+                         SpdmErrorCode::SpdmErrorUnexpectedRequest,
+-                        None,
+                         bytes,
++                        response_buffer,
+                     )
+-                    .await
+                 }
+ 
+                 SpdmRequestResponseCode::SpdmRequestPskFinish
+                 | SpdmRequestResponseCode::SpdmRequestHeartbeat
+                 | SpdmRequestResponseCode::SpdmRequestKeyUpdate
+-                | SpdmRequestResponseCode::SpdmRequestEndSession => {
+-                    self.handle_error_request(
+-                        SpdmErrorCode::SpdmErrorUnexpectedRequest,
+-                        None,
+-                        bytes,
+-                    )
+-                    .await
+-                }
+-
+-                SpdmRequestResponseCode::SpdmRequestResponseIfReady => {
+-                    self.handle_error_request(
+-                        SpdmErrorCode::SpdmErrorUnsupportedRequest,
+-                        None,
+-                        bytes,
+-                    )
+-                    .await
+-                }
+-
+-                _ => Err(SPDM_STATUS_UNSUPPORTED_CAP),
++                | SpdmRequestResponseCode::SpdmRequestEndSession => self.handle_error_request(
++                    SpdmErrorCode::SpdmErrorUnexpectedRequest,
++                    bytes,
++                    response_buffer,
++                ),
++
++                SpdmRequestResponseCode::SpdmRequestResponseIfReady => self.handle_error_request(
++                    SpdmErrorCode::SpdmErrorUnsupportedRequest,
++                    bytes,
++                    response_buffer,
++                ),
++
++                _ => DropIt,
+             },
+-            None => Err(SPDM_STATUS_UNSUPPORTED_CAP),
++            None => DropIt,
+         }
+     }
+ }
+diff --git a/spdmlib/src/responder/digest_rsp.rs b/spdmlib/src/responder/digest_rsp.rs
+index ddaab3f..5024def 100644
+--- a/spdmlib/src/responder/digest_rsp.rs
++++ b/spdmlib/src/responder/digest_rsp.rs
+@@ -4,27 +4,27 @@
+ 
+ use crate::common::SpdmCodec;
+ use crate::common::SpdmConnectionState;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::crypto;
+ use crate::message::*;
+ use crate::protocol::*;
+ use crate::responder::*;
+ extern crate alloc;
+-use crate::error::SpdmResult;
+ use crate::protocol::gen_array_clone;
+ use alloc::boxed::Box;
+ 
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
++
+ impl ResponderContext {
+-    pub async fn handle_spdm_digest(
++    pub fn handle_spdm_digest(
+         &mut self,
+         bytes: &[u8],
+         session_id: Option<u32>,
+-    ) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_digest_response(session_id, bytes, &mut writer);
+-
+-        self.send_message(session_id, writer.used_slice(), false)
+-            .await
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_digest_response(session_id, bytes, &mut writer)
+     }
+ 
+     fn write_spdm_digest_response(
+@@ -32,23 +32,23 @@ impl ResponderContext {
+         session_id: Option<u32>,
+         bytes: &[u8],
+         writer: &mut Writer,
+-    ) {
++    ) -> Reply {
+         if self.common.runtime_info.get_connection_state().get_u8()
+             < SpdmConnectionState::SpdmConnectionNegotiated.get_u8()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnexpectedRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         self.common.reset_buffer_via_request_code(
+@@ -62,21 +62,17 @@ impl ResponderContext {
+         } else {
+             error!("!!! get_digests : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+-        match session_id {
+-            None => {
+-                if self
+-                    .common
+-                    .append_message_b(&bytes[..reader.used()])
+-                    .is_err()
+-                {
+-                    self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                    return;
+-                }
+-            }
+-            Some(_session_id) => {}
++        if session_id.is_none()
++            && self
++                .common
++                .append_message_b(&bytes[..reader.used()])
++                .is_err()
++        {
++            self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
++            return SendIt(writer.used());
+         }
+ 
+         let digest_size = self.common.negotiate_info.base_hash_sel.get_size();
+@@ -108,7 +104,7 @@ impl ResponderContext {
+         let res = response.spdm_encode(&mut self.common, writer);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         for slot_id in 0..SPDM_MAX_SLOT_NUMBER {
+@@ -129,13 +125,10 @@ impl ResponderContext {
+             }
+         }
+ 
+-        match session_id {
+-            None => {
+-                if self.common.append_message_b(writer.used_slice()).is_err() {
+-                    self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                }
+-            }
+-            Some(_session_id) => {}
++        if session_id.is_none() && self.common.append_message_b(writer.used_slice()).is_err() {
++            self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+         }
++
++        SendIt(writer.used())
+     }
+ }
+diff --git a/spdmlib/src/responder/encap_rsp.rs b/spdmlib/src/responder/encap_rsp.rs
+index 2bd31ac..4505ecb 100644
+--- a/spdmlib/src/responder/encap_rsp.rs
++++ b/spdmlib/src/responder/encap_rsp.rs
+@@ -6,7 +6,7 @@ use codec::{Codec, Reader, Writer};
+ 
+ use crate::{
+     common::{SpdmCodec, SpdmConnectionState},
+-    config,
++    config::MAX_SPDM_MSG_SIZE,
+     error::{
+         SpdmResult, SPDM_STATUS_BUFFER_FULL, SPDM_STATUS_INVALID_MSG_FIELD,
+         SPDM_STATUS_INVALID_MSG_SIZE, SPDM_STATUS_NOT_READY_PEER, SPDM_STATUS_UNSUPPORTED_CAP,
+@@ -21,36 +21,34 @@ use crate::{
+ 
+ use super::ResponderContext;
+ 
++use super::context::Reply;
++use crate::responder::context::Reply::{DropIt, SendIt};
++
+ impl ResponderContext {
+-    pub async fn handle_get_encapsulated_request(
++    pub fn handle_get_encapsulated_request(
+         &mut self,
+-        session_id: u32,
+         bytes: &[u8],
+-    ) -> SpdmResult {
+-        let mut encapsulated_request = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut encapsulated_request);
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
+ 
+         self.encap_check_version_cap_state(
+             SpdmRequestResponseCode::SpdmRequestGetEncapsulatedRequest.get_u8(),
+             &mut writer,
+-        )
+-        .await;
+-        self.write_encap_request_response(bytes, &mut writer);
+-
+-        self.send_message(Some(session_id), writer.used_slice(), false)
+-            .await
++        )?;
++        self.write_encap_request_response(bytes, &mut writer)
+     }
+ 
+-    fn write_encap_request_response(&mut self, bytes: &[u8], writer: &mut Writer) {
++    fn write_encap_request_response(&mut self, bytes: &[u8], writer: &mut Writer) -> Reply {
+         let mut reader = Reader::init(bytes);
+         if let Some(request_header) = SpdmMessageHeader::read(&mut reader) {
+             if request_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         };
+ 
+         let encapsulated_request = SpdmMessage {
+@@ -70,44 +68,40 @@ impl ResponderContext {
+             .is_err()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         if self.encode_encap_request_get_digest(writer).is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidResponseCode, 0, writer);
+-            return;
+         }
++
++        SendIt(writer.used())
+     }
+ 
+-    pub async fn handle_deliver_encapsulated_reponse(
++    pub fn handle_deliver_encapsulated_reponse(
+         &mut self,
+-        session_id: u32,
+         bytes: &[u8],
+-    ) -> SpdmResult {
+-        let mut encap_response_ack = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut encap_response_ack);
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
+ 
+         self.encap_check_version_cap_state(
+             SpdmRequestResponseCode::SpdmRequestGetEncapsulatedRequest.get_u8(),
+             &mut writer,
+-        )
+-        .await;
+-        self.write_encap_response_ack_response(bytes, &mut writer);
+-
+-        self.send_message(Some(session_id), writer.used_slice(), false)
+-            .await
++        )?;
++        self.write_encap_response_ack_response(bytes, &mut writer)
+     }
+ 
+-    fn write_encap_response_ack_response(&mut self, bytes: &[u8], writer: &mut Writer) {
++    fn write_encap_response_ack_response(&mut self, bytes: &[u8], writer: &mut Writer) -> Reply {
+         let mut reader = Reader::init(bytes);
+         if let Some(request_header) = SpdmMessageHeader::read(&mut reader) {
+             if request_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         };
+ 
+         let encap_response_payload = if let Some(encap_response_payload) =
+@@ -116,7 +110,7 @@ impl ResponderContext {
+             encap_response_payload
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         };
+ 
+         if self
+@@ -125,21 +119,24 @@ impl ResponderContext {
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidResponseCode, 0, writer);
+         }
++
++        SendIt(writer.used())
+     }
+ 
+-    async fn encap_check_version_cap_state(
++    fn encap_check_version_cap_state(
+         &mut self,
+         request_response_code: u8,
+         writer: &mut Writer<'_>,
+-    ) {
++    ) -> Reply {
+         if self.common.negotiate_info.spdm_version_sel.get_u8()
+             < SpdmVersion::SpdmVersion11.get_u8()
+         {
+-            self.send_spdm_error(
++            self.write_spdm_error(
+                 SpdmErrorCode::SpdmErrorUnsupportedRequest,
+                 request_response_code,
+-            )
+-            .await
++                writer,
++            );
++            return SendIt(writer.used());
+         }
+ 
+         if !self
+@@ -158,14 +155,17 @@ impl ResponderContext {
+                 request_response_code,
+                 writer,
+             );
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         if self.common.runtime_info.get_connection_state().get_u8()
+             < SpdmConnectionState::SpdmConnectionAfterCertificate.get_u8()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnexpectedRequest, 0, writer);
++            return SendIt(writer.used());
+         }
++
++        DropIt
+     }
+ 
+     fn process_encapsulated_response(
+diff --git a/spdmlib/src/responder/end_session_rsp.rs b/spdmlib/src/responder/end_session_rsp.rs
+index 653c821..6f3440d 100644
+--- a/spdmlib/src/responder/end_session_rsp.rs
++++ b/spdmlib/src/responder/end_session_rsp.rs
+@@ -3,17 +3,22 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ use crate::common::SpdmCodec;
+-use crate::error::SpdmResult;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::message::*;
+ use crate::responder::*;
+ 
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
++
+ impl ResponderContext {
+-    pub async fn handle_spdm_end_session(&mut self, session_id: u32, bytes: &[u8]) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_end_session_response(session_id, bytes, &mut writer);
+-        self.send_message(Some(session_id), writer.used_slice(), false)
+-            .await
++    pub fn handle_spdm_end_session(
++        &mut self,
++        session_id: u32,
++        bytes: &[u8],
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_end_session_response(session_id, bytes, &mut writer)
+     }
+ 
+     pub fn write_spdm_end_session_response(
+@@ -21,17 +26,17 @@ impl ResponderContext {
+         session_id: u32,
+         bytes: &[u8],
+         writer: &mut Writer,
+-    ) {
++    ) -> Reply {
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         let end_session_req =
+@@ -41,7 +46,7 @@ impl ResponderContext {
+         } else {
+             error!("!!! end_session req : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         self.common.reset_buffer_via_request_code(
+@@ -62,5 +67,7 @@ impl ResponderContext {
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+         }
++
++        SendIt(writer.used())
+     }
+ }
+diff --git a/spdmlib/src/responder/error_rsp.rs b/spdmlib/src/responder/error_rsp.rs
+index b26764e..5473a88 100644
+--- a/spdmlib/src/responder/error_rsp.rs
++++ b/spdmlib/src/responder/error_rsp.rs
+@@ -3,10 +3,13 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ use crate::common::SpdmCodec;
+-use crate::error::SpdmResult;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::message::*;
+ use crate::responder::*;
+ 
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
++
+ impl ResponderContext {
+     pub fn write_spdm_error(
+         &mut self,
+@@ -27,31 +30,21 @@ impl ResponderContext {
+                 ),
+             }),
+         };
++        writer.clear();
+         let _ = error.spdm_encode(&mut self.common, writer);
+     }
+-
+-    pub async fn send_spdm_error(&mut self, error_code: SpdmErrorCode, error_data: u8) {
+-        info!("send spdm version\n");
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_error(error_code, error_data, &mut writer);
+-        let _ = self.send_message(None, writer.used_slice(), false).await;
+-    }
+ }
+ 
+ impl ResponderContext {
+-    pub async fn handle_error_request(
++    pub fn handle_error_request(
+         &mut self,
+         error_code: SpdmErrorCode,
+-        session_id: Option<u32>,
+         bytes: &[u8],
+-    ) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
+         self.write_error_response(error_code, bytes, &mut writer);
+-
+-        self.send_message(session_id, writer.used_slice(), false)
+-            .await
++        SendIt(writer.used())
+     }
+ 
+     pub fn write_error_response(
+diff --git a/spdmlib/src/responder/finish_rsp.rs b/spdmlib/src/responder/finish_rsp.rs
+index 469a22a..9d1b1b2 100644
+--- a/spdmlib/src/responder/finish_rsp.rs
++++ b/spdmlib/src/responder/finish_rsp.rs
+@@ -4,10 +4,9 @@
+ 
+ use crate::common::session::SpdmSession;
+ use crate::common::{ManagedBuffer12Sign, SpdmCodec};
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::crypto;
+ use crate::error::SpdmResult;
+-use crate::error::SPDM_STATUS_CRYPTO_ERROR;
+-use crate::error::SPDM_STATUS_INVALID_MSG_FIELD;
+ use crate::error::SPDM_STATUS_INVALID_STATE_LOCAL;
+ use crate::error::*;
+ use crate::message::*;
+@@ -16,29 +15,18 @@ use crate::responder::*;
+ extern crate alloc;
+ use alloc::boxed::Box;
+ 
+-impl ResponderContext {
+-    pub async fn handle_spdm_finish(&mut self, session_id: u32, bytes: &[u8]) -> SpdmResult {
+-        let in_clear_text = self
+-            .common
+-            .negotiate_info
+-            .req_capabilities_sel
+-            .contains(SpdmRequestCapabilityFlags::HANDSHAKE_IN_THE_CLEAR_CAP)
+-            && self
+-                .common
+-                .negotiate_info
+-                .rsp_capabilities_sel
+-                .contains(SpdmResponseCapabilityFlags::HANDSHAKE_IN_THE_CLEAR_CAP);
+-        info!("in_clear_text {:?}\n", in_clear_text);
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
+ 
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_finish_response(session_id, bytes, &mut writer)?;
+-        if in_clear_text {
+-            self.send_message(None, writer.used_slice(), false).await
+-        } else {
+-            self.send_message(Some(session_id), writer.used_slice(), false)
+-                .await
+-        }
++impl ResponderContext {
++    pub fn handle_spdm_finish(
++        &mut self,
++        session_id: u32,
++        bytes: &[u8],
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_finish_response(session_id, bytes, &mut writer)
+     }
+ 
+     // Return true on success, false otherwise.
+@@ -47,17 +35,17 @@ impl ResponderContext {
+         session_id: u32,
+         bytes: &[u8],
+         writer: &mut Writer,
+-    ) -> SpdmResult {
++    ) -> Reply {
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++            return SendIt(writer.used());
+         }
+ 
+         self.common.reset_buffer_via_request_code(
+@@ -71,7 +59,7 @@ impl ResponderContext {
+         } else {
+             error!("!!! finish req : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++            return SendIt(writer.used());
+         }
+         let finish_req = finish_req.unwrap();
+ 
+@@ -81,7 +69,7 @@ impl ResponderContext {
+             .is_err()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+ 
+         let mut_auth_attributes = self
+@@ -98,7 +86,7 @@ impl ResponderContext {
+                     .contains(SpdmFinishRequestAttributes::SIGNATURE_INCLUDED))
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++            return SendIt(writer.used());
+         }
+ 
+         let is_mut_auth = !mut_auth_attributes.is_empty();
+@@ -114,7 +102,7 @@ impl ResponderContext {
+             {
+                 error!("verify finish request signature error");
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorDecryptError, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+             info!("verify_finish_req_signature pass");
+ 
+@@ -124,7 +112,7 @@ impl ResponderContext {
+                 .is_err()
+             {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+         }
+ 
+@@ -136,7 +124,7 @@ impl ResponderContext {
+ 
+             if session.get_use_psk() {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-                return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                return SendIt(writer.used());
+             }
+ 
+             let session = self
+@@ -151,7 +139,7 @@ impl ResponderContext {
+                     .calc_rsp_transcript_hash(false, slot_id, is_mut_auth, session);
+             if transcript_hash.is_err() {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+             let transcript_hash = transcript_hash.as_ref().unwrap();
+ 
+@@ -164,7 +152,7 @@ impl ResponderContext {
+             {
+                 error!("verify_hmac_with_request_finished_key fail");
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorDecryptError, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             } else {
+                 info!("verify_hmac_with_request_finished_key pass");
+             }
+@@ -176,7 +164,7 @@ impl ResponderContext {
+             {
+                 error!("message_f add the message error");
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+         }
+ 
+@@ -213,7 +201,7 @@ impl ResponderContext {
+         let res = response.spdm_encode(&mut self.common, writer);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_STATE_LOCAL);
++            return SendIt(writer.used());
+         }
+         let used = writer.used();
+ 
+@@ -228,7 +216,7 @@ impl ResponderContext {
+             {
+                 error!("message_f add the message error");
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+ 
+             let session = self
+@@ -243,14 +231,14 @@ impl ResponderContext {
+                     .calc_rsp_transcript_hash(false, slot_id, is_mut_auth, session);
+             if transcript_hash.is_err() {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+             let transcript_hash = transcript_hash.unwrap();
+ 
+             let hmac = session.generate_hmac_with_response_finished_key(transcript_hash.as_ref());
+             if hmac.is_err() {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+             let hmac = hmac.unwrap();
+ 
+@@ -260,7 +248,7 @@ impl ResponderContext {
+                 .is_err()
+             {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+ 
+             // patch the message before send
+@@ -272,7 +260,7 @@ impl ResponderContext {
+         {
+             error!("message_f add the message error");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+ 
+         // generate the data secret
+@@ -287,13 +275,20 @@ impl ResponderContext {
+ 
+         if th2.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+         let th2 = th2.unwrap();
+         debug!("!!! th2 : {:02x?}\n", th2.as_ref());
+         let spdm_version_sel = self.common.negotiate_info.spdm_version_sel;
+         let session = self.common.get_session_via_id(session_id).unwrap();
+-        session.generate_data_secret(spdm_version_sel, &th2)
++        if session
++            .generate_data_secret(spdm_version_sel, &th2)
++            .is_err()
++        {
++            self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
++            return SendIt(writer.used());
++        }
++        Reply::DropIt
+     }
+ 
+     #[cfg(not(feature = "hashed-transcript-data"))]
+diff --git a/spdmlib/src/responder/heartbeat_rsp.rs b/spdmlib/src/responder/heartbeat_rsp.rs
+index dc5ebbf..932d141 100644
+--- a/spdmlib/src/responder/heartbeat_rsp.rs
++++ b/spdmlib/src/responder/heartbeat_rsp.rs
+@@ -3,17 +3,22 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ use crate::common::SpdmCodec;
+-use crate::error::SpdmResult;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::message::*;
+ use crate::responder::*;
+ 
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
++
+ impl ResponderContext {
+-    pub async fn handle_spdm_heartbeat(&mut self, session_id: u32, bytes: &[u8]) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_heartbeat_response(session_id, bytes, &mut writer);
+-        self.send_message(Some(session_id), writer.used_slice(), false)
+-            .await
++    pub fn handle_spdm_heartbeat(
++        &mut self,
++        session_id: u32,
++        bytes: &[u8],
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_heartbeat_response(session_id, bytes, &mut writer)
+     }
+ 
+     pub fn write_spdm_heartbeat_response(
+@@ -21,17 +26,17 @@ impl ResponderContext {
+         session_id: u32,
+         bytes: &[u8],
+         writer: &mut Writer,
+-    ) {
++    ) -> Reply {
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         self.common.reset_buffer_via_request_code(
+@@ -45,7 +50,7 @@ impl ResponderContext {
+         } else {
+             error!("!!! heartbeat req : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         info!("send spdm heartbeat rsp\n");
+@@ -61,5 +66,7 @@ impl ResponderContext {
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+         }
++
++        SendIt(writer.used())
+     }
+ }
+diff --git a/spdmlib/src/responder/key_exchange_rsp.rs b/spdmlib/src/responder/key_exchange_rsp.rs
+index ca99a46..0b7f4fa 100644
+--- a/spdmlib/src/responder/key_exchange_rsp.rs
++++ b/spdmlib/src/responder/key_exchange_rsp.rs
+@@ -9,10 +9,10 @@ use crate::common::SpdmCodec;
+ use crate::common::SpdmConnectionState;
+ use crate::common::SpdmOpaqueSupport;
+ use crate::common::SpdmTransportEncap;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::crypto;
+ use crate::error::{
+-    SpdmResult, SPDM_STATUS_BUFFER_FULL, SPDM_STATUS_CRYPTO_ERROR, SPDM_STATUS_INVALID_MSG_FIELD,
+-    SPDM_STATUS_INVALID_STATE_LOCAL, SPDM_STATUS_INVALID_STATE_PEER,
++    SpdmResult, SPDM_STATUS_BUFFER_FULL, SPDM_STATUS_CRYPTO_ERROR, SPDM_STATUS_INVALID_STATE_LOCAL,
+ };
+ use crate::protocol::*;
+ use crate::responder::*;
+@@ -23,39 +23,40 @@ use crate::secret;
+ use alloc::boxed::Box;
+ use core::ops::DerefMut;
+ 
+-impl ResponderContext {
+-    pub async fn handle_spdm_key_exchange(&mut self, bytes: &[u8]) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_key_exchange_response(bytes, &mut writer)?;
+-        self.send_message(None, writer.used_slice(), false).await
+-    }
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
+ 
+-    pub fn write_spdm_key_exchange_response(
++impl ResponderContext {
++    pub fn handle_spdm_key_exchange(
+         &mut self,
+         bytes: &[u8],
+-        writer: &mut Writer,
+-    ) -> SpdmResult {
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_key_exchange_response(bytes, &mut writer)
++    }
++
++    pub fn write_spdm_key_exchange_response(&mut self, bytes: &[u8], writer: &mut Writer) -> Reply {
+         if self.common.runtime_info.get_connection_state().get_u8()
+             < SpdmConnectionState::SpdmConnectionNegotiated.get_u8()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnexpectedRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_STATE_PEER);
++            return SendIt(writer.used());
+         }
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                return SendIt(writer.used());
+             }
+             if message_header.version.get_u8() < SpdmVersion::SpdmVersion11.get_u8() {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnsupportedRequest, 0, writer);
+-                return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++            return SendIt(writer.used());
+         }
+ 
+         self.common
+@@ -86,12 +87,12 @@ impl ResponderContext {
+                     );
+                 if measurement_summary_hash_res.is_none() {
+                     self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                    return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                    return SendIt(writer.used());
+                 }
+                 measurement_summary_hash = measurement_summary_hash_res.unwrap();
+                 if measurement_summary_hash.data_size == 0 {
+                     self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                    return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                    return SendIt(writer.used());
+                 }
+             } else {
+                 self.common.runtime_info.need_measurement_summary_hash = false;
+@@ -110,7 +111,7 @@ impl ResponderContext {
+                     > crate::common::opaque::MAX_SECURE_SPDM_VERSION_COUNT as u8
+                 {
+                     self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-                    return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                    return SendIt(writer.used());
+                 }
+                 for index in 0..secured_message_version_list.version_count as usize {
+                     for local_version in self.common.config_info.secure_spdm_version {
+@@ -150,7 +151,7 @@ impl ResponderContext {
+                                     0,
+                                     writer,
+                                 );
+-                                return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                                return SendIt(writer.used());
+                             }
+                         }
+                     }
+@@ -159,18 +160,18 @@ impl ResponderContext {
+         } else {
+             error!("!!! key_exchange req : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++            return SendIt(writer.used());
+         }
+ 
+         let key_exchange_req = key_exchange_req.unwrap();
+         let slot_id = key_exchange_req.slot_id as usize;
+         if slot_id >= SPDM_MAX_SLOT_NUMBER {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++            return SendIt(writer.used());
+         }
+         if self.common.provision_info.my_cert_chain[slot_id].is_none() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++            return SendIt(writer.used());
+         }
+ 
+         self.common
+@@ -191,7 +192,7 @@ impl ResponderContext {
+ 
+         if final_key.is_none() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+         let final_key = final_key.unwrap();
+         debug!("!!! final_key : {:02x?}\n", final_key.as_ref());
+@@ -199,7 +200,7 @@ impl ResponderContext {
+         let rsp_session_id = self.common.get_next_half_session_id(false);
+         if rsp_session_id.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorSessionLimitExceeded, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_STATE_LOCAL);
++            return SendIt(writer.used());
+         }
+         let rsp_session_id = rsp_session_id.unwrap();
+ 
+@@ -226,14 +227,14 @@ impl ResponderContext {
+         let cert_chain_hash = self.common.get_certchain_hash_local(false, slot_id);
+         if cert_chain_hash.is_none() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++            return SendIt(writer.used());
+         }
+ 
+         let session = self.common.get_next_avaiable_session();
+         if session.is_none() {
+             error!("!!! too many sessions : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorSessionLimitExceeded, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_STATE_LOCAL);
++            return SendIt(writer.used());
+         }
+ 
+         #[cfg(feature = "mut-auth")]
+@@ -252,7 +253,7 @@ impl ResponderContext {
+         if session.set_dhe_secret(spdm_version_sel, final_key).is_err() {
+             let _ = session.teardown(session_id);
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+         session.runtime_info.message_a = message_a;
+         session.runtime_info.rsp_cert_hash = cert_chain_hash;
+@@ -262,7 +263,7 @@ impl ResponderContext {
+         let res = crypto::rand::get_random(&mut random);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+ 
+         let in_clear_text = self
+@@ -308,7 +309,7 @@ impl ResponderContext {
+         let res = response.spdm_encode(&mut self.common, writer);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_STATE_LOCAL);
++            return SendIt(writer.used());
+         }
+         let used = writer.used();
+ 
+@@ -327,7 +328,7 @@ impl ResponderContext {
+             .is_err()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+         if self
+             .common
+@@ -335,7 +336,7 @@ impl ResponderContext {
+             .is_err()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+ 
+         let session = self
+@@ -346,7 +347,7 @@ impl ResponderContext {
+         let signature = self.generate_key_exchange_rsp_signature(slot_id as u8, session);
+         if signature.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+         let signature = signature.unwrap();
+ 
+@@ -356,7 +357,7 @@ impl ResponderContext {
+             .is_err()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+ 
+         let session = self
+@@ -370,13 +371,19 @@ impl ResponderContext {
+             .calc_rsp_transcript_hash(false, slot_id as u8, false, session);
+         if th1.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+         let th1 = th1.unwrap();
+         debug!("!!! th1 : {:02x?}\n", th1.as_ref());
+ 
+         let session = self.common.get_session_via_id(session_id).unwrap();
+-        session.generate_handshake_secret(spdm_version_sel, &th1)?;
++        if session
++            .generate_handshake_secret(spdm_version_sel, &th1)
++            .is_err()
++        {
++            self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
++            return SendIt(writer.used());
++        }
+ 
+         if !in_clear_text {
+             let session = self
+@@ -390,7 +397,7 @@ impl ResponderContext {
+                     .calc_rsp_transcript_hash(false, slot_id as u8, false, session);
+             if transcript_hash.is_err() {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+             let transcript_hash = transcript_hash.unwrap();
+ 
+@@ -400,7 +407,7 @@ impl ResponderContext {
+             if hmac.is_err() {
+                 let _ = session.teardown(session_id);
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+             let hmac = hmac.unwrap();
+ 
+@@ -413,7 +420,7 @@ impl ResponderContext {
+                 let session = self.common.get_session_via_id(session_id).unwrap();
+                 let _ = session.teardown(session_id);
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+ 
+             // patch the message before send
+@@ -440,7 +447,7 @@ impl ResponderContext {
+                 .set_last_session_id(Some(session_id));
+         }
+ 
+-        Ok(())
++        SendIt(writer.used())
+     }
+ 
+     #[cfg(feature = "hashed-transcript-data")]
+diff --git a/spdmlib/src/responder/key_update_rsp.rs b/spdmlib/src/responder/key_update_rsp.rs
+index 364cd1d..e82bc8c 100644
+--- a/spdmlib/src/responder/key_update_rsp.rs
++++ b/spdmlib/src/responder/key_update_rsp.rs
+@@ -3,17 +3,22 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ use crate::common::SpdmCodec;
+-use crate::error::SpdmResult;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::message::*;
+ use crate::responder::*;
+ 
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
++
+ impl ResponderContext {
+-    pub async fn handle_spdm_key_update(&mut self, session_id: u32, bytes: &[u8]) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_key_update_response(session_id, bytes, &mut writer);
+-        self.send_message(Some(session_id), writer.used_slice(), false)
+-            .await
++    pub fn handle_spdm_key_update(
++        &mut self,
++        session_id: u32,
++        bytes: &[u8],
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_key_update_response(session_id, bytes, &mut writer)
+     }
+ 
+     pub fn write_spdm_key_update_response(
+@@ -21,17 +26,17 @@ impl ResponderContext {
+         session_id: u32,
+         bytes: &[u8],
+         writer: &mut Writer,
+-    ) {
++    ) -> Reply {
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         self.common.reset_buffer_via_request_code(
+@@ -45,7 +50,7 @@ impl ResponderContext {
+         } else {
+             error!("!!! key_update req : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         let key_update_req = key_update_req.unwrap();
+ 
+@@ -65,7 +70,7 @@ impl ResponderContext {
+             _ => {
+                 error!("!!! key_update req : fail !!!\n");
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         }
+ 
+@@ -85,5 +90,7 @@ impl ResponderContext {
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+         }
++
++        SendIt(writer.used())
+     }
+ }
+diff --git a/spdmlib/src/responder/measurement_rsp.rs b/spdmlib/src/responder/measurement_rsp.rs
+index 450c803..d8355ae 100644
+--- a/spdmlib/src/responder/measurement_rsp.rs
++++ b/spdmlib/src/responder/measurement_rsp.rs
+@@ -10,6 +10,7 @@ use crate::common::ManagedBufferL1L2;
+ use crate::common::SpdmCodec;
+ use crate::common::SpdmConnectionState;
+ use crate::common::SpdmMeasurementContentChanged;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::crypto;
+ use crate::error::SpdmResult;
+ use crate::error::SPDM_STATUS_BUFFER_FULL;
+@@ -23,42 +24,42 @@ use crate::protocol::*;
+ use crate::responder::*;
+ use crate::secret;
+ 
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
++
+ impl ResponderContext {
+-    pub async fn handle_spdm_measurement(
++    pub fn handle_spdm_measurement(
+         &mut self,
+         session_id: Option<u32>,
+         bytes: &[u8],
+-    ) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
+         self.write_spdm_measurement_response(session_id, bytes, &mut writer)
+-            .await;
+-        self.send_message(session_id, writer.used_slice(), false)
+-            .await
+     }
+ 
+-    pub async fn write_spdm_measurement_response(
++    pub fn write_spdm_measurement_response(
+         &mut self,
+         session_id: Option<u32>,
+         bytes: &[u8],
+         writer: &mut Writer<'_>,
+-    ) {
++    ) -> Reply {
+         if self.common.runtime_info.get_connection_state().get_u8()
+             < SpdmConnectionState::SpdmConnectionNegotiated.get_u8()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnexpectedRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         self.common.reset_buffer_via_request_code(
+@@ -73,7 +74,7 @@ impl ResponderContext {
+         } else {
+             error!("!!! get_measurements : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         let get_measurements = get_measurements.unwrap();
+         let slot_id = get_measurements.slot_id as usize;
+@@ -88,18 +89,18 @@ impl ResponderContext {
+ 
+             if slot_id >= SPDM_MAX_SLOT_NUMBER {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+             if self.common.provision_info.my_cert_chain[slot_id].is_none() {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             self.common.runtime_info.need_measurement_signature = false;
+ 
+             if slot_id != 0 {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         }
+ 
+@@ -117,7 +118,7 @@ impl ResponderContext {
+             .is_err()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         let real_measurement_block_count = secret::measurement::measurement_collection(
+@@ -153,7 +154,7 @@ impl ResponderContext {
+         {
+             if index > real_measurement_block_count {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+             secret::measurement::measurement_collection(
+                 spdm_version_sel,
+@@ -178,7 +179,7 @@ impl ResponderContext {
+         let res = crypto::rand::get_random(&mut nonce);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         info!("send spdm measurement\n");
+@@ -210,7 +211,7 @@ impl ResponderContext {
+         let res = response.spdm_encode(&mut self.common, writer);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         let used = writer.used();
+ 
+@@ -228,14 +229,13 @@ impl ResponderContext {
+                 .is_err()
+             {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+ 
+             let signature = self.generate_measurement_signature(session_id);
+             if signature.is_err() {
+-                self.send_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0)
+-                    .await;
+-                return;
++                self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
++                return SendIt(writer.used());
+             }
+             let signature = signature.unwrap();
+             // patch the message before send
+@@ -250,6 +250,8 @@ impl ResponderContext {
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+         }
++
++        SendIt(writer.used())
+     }
+ 
+     #[cfg(feature = "hashed-transcript-data")]
+diff --git a/spdmlib/src/responder/psk_exchange_rsp.rs b/spdmlib/src/responder/psk_exchange_rsp.rs
+index 230f31d..61b0bae 100644
+--- a/spdmlib/src/responder/psk_exchange_rsp.rs
++++ b/spdmlib/src/responder/psk_exchange_rsp.rs
+@@ -8,12 +8,8 @@ use crate::common::SpdmConnectionState;
+ use crate::common::SpdmOpaqueSupport;
+ use crate::common::SpdmTransportEncap;
+ use crate::common::INVALID_SLOT;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::crypto;
+-use crate::error::SpdmResult;
+-use crate::error::SPDM_STATUS_CRYPTO_ERROR;
+-use crate::error::SPDM_STATUS_INVALID_MSG_FIELD;
+-use crate::error::SPDM_STATUS_INVALID_STATE_LOCAL;
+-use crate::error::SPDM_STATUS_INVALID_STATE_PEER;
+ use crate::message::*;
+ use crate::protocol::*;
+ use crate::responder::*;
+@@ -23,39 +19,40 @@ use crate::secret;
+ use alloc::boxed::Box;
+ use core::ops::DerefMut;
+ 
+-impl ResponderContext {
+-    pub async fn handle_spdm_psk_exchange(&mut self, bytes: &[u8]) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_psk_exchange_response(bytes, &mut writer)?;
+-        self.send_message(None, writer.used_slice(), false).await
+-    }
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
+ 
+-    pub fn write_spdm_psk_exchange_response(
++impl ResponderContext {
++    pub fn handle_spdm_psk_exchange(
+         &mut self,
+         bytes: &[u8],
+-        writer: &mut Writer,
+-    ) -> SpdmResult {
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_psk_exchange_response(bytes, &mut writer)
++    }
++
++    pub fn write_spdm_psk_exchange_response(&mut self, bytes: &[u8], writer: &mut Writer) -> Reply {
+         if self.common.runtime_info.get_connection_state().get_u8()
+             < SpdmConnectionState::SpdmConnectionNegotiated.get_u8()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnexpectedRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_STATE_PEER);
++            return SendIt(writer.used());
+         }
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                return SendIt(writer.used());
+             }
+             if message_header.version.get_u8() < SpdmVersion::SpdmVersion11.get_u8() {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnsupportedRequest, 0, writer);
+-                return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++            return SendIt(writer.used());
+         }
+ 
+         self.common
+@@ -87,12 +84,12 @@ impl ResponderContext {
+                     );
+                 if measurement_summary_hash_res.is_none() {
+                     self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                    return Err(SPDM_STATUS_CRYPTO_ERROR);
++                    return SendIt(writer.used());
+                 }
+                 measurement_summary_hash = measurement_summary_hash_res.unwrap();
+                 if measurement_summary_hash.data_size == 0 {
+                     self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                    return Err(SPDM_STATUS_CRYPTO_ERROR);
++                    return SendIt(writer.used());
+                 }
+             } else {
+                 self.common.runtime_info.need_measurement_summary_hash = false;
+@@ -109,7 +106,7 @@ impl ResponderContext {
+                     > crate::common::opaque::MAX_SECURE_SPDM_VERSION_COUNT as u8
+                 {
+                     self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-                    return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                    return SendIt(writer.used());
+                 }
+                 for index in 0..secured_message_version_list.version_count as usize {
+                     for local_version in self.common.config_info.secure_spdm_version {
+@@ -149,7 +146,7 @@ impl ResponderContext {
+                                     0,
+                                     writer,
+                                 );
+-                                return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                                return SendIt(writer.used());
+                             }
+                         }
+                     }
+@@ -158,7 +155,7 @@ impl ResponderContext {
+         } else {
+             error!("!!! psk_exchange req : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++            return SendIt(writer.used());
+         }
+ 
+         let psk_without_context = self
+@@ -176,14 +173,14 @@ impl ResponderContext {
+             let res = crypto::rand::get_random(&mut psk_context);
+             if res.is_err() {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+         }
+ 
+         let rsp_session_id = self.common.get_next_half_session_id(false);
+         if rsp_session_id.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorSessionLimitExceeded, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_STATE_LOCAL);
++            return SendIt(writer.used());
+         }
+         let rsp_session_id = rsp_session_id.unwrap();
+ 
+@@ -212,7 +209,7 @@ impl ResponderContext {
+         if session.is_none() {
+             error!("!!! too many sessions : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorSessionLimitExceeded, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_STATE_LOCAL);
++            return SendIt(writer.used());
+         }
+ 
+         let session = session.unwrap();
+@@ -256,7 +253,7 @@ impl ResponderContext {
+         let res = response.spdm_encode(&mut self.common, writer);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_STATE_LOCAL);
++            return SendIt(writer.used());
+         }
+         let used = writer.used();
+ 
+@@ -269,7 +266,7 @@ impl ResponderContext {
+             .is_err()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+         if self
+             .common
+@@ -277,7 +274,7 @@ impl ResponderContext {
+             .is_err()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+ 
+         let session = self
+@@ -291,13 +288,19 @@ impl ResponderContext {
+             .calc_rsp_transcript_hash(true, INVALID_SLOT, false, session);
+         if th1.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+         let th1 = th1.unwrap();
+         debug!("!!! th1 : {:02x?}\n", th1.as_ref());
+ 
+         let session = self.common.get_session_via_id(session_id).unwrap();
+-        session.generate_handshake_secret(spdm_version_sel, &th1)?;
++        if session
++            .generate_handshake_secret(spdm_version_sel, &th1)
++            .is_err()
++        {
++            self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
++            return SendIt(writer.used());
++        }
+ 
+         let session = self
+             .common
+@@ -309,7 +312,7 @@ impl ResponderContext {
+                 .calc_rsp_transcript_hash(true, INVALID_SLOT, false, session);
+         if transcript_hash.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+         let transcript_hash = transcript_hash.unwrap();
+ 
+@@ -318,7 +321,7 @@ impl ResponderContext {
+             let session = self.common.get_session_via_id(session_id).unwrap();
+             let _ = session.teardown(session_id);
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+         let hmac = hmac.unwrap();
+ 
+@@ -331,7 +334,7 @@ impl ResponderContext {
+             let session = self.common.get_session_via_id(session_id).unwrap();
+             let _ = session.teardown(session_id);
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+ 
+         // patch the message before send
+@@ -352,7 +355,7 @@ impl ResponderContext {
+                 .calc_rsp_transcript_hash(true, 0, false, session);
+             if th2.is_err() {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+             let th2 = th2.unwrap();
+             debug!("!!! th2 : {:02x?}\n", th2.as_ref());
+@@ -373,6 +376,6 @@ impl ResponderContext {
+                 return_opaque.data[return_opaque.data_size as usize - 1];
+         }
+ 
+-        Ok(())
++        SendIt(writer.used())
+     }
+ }
+diff --git a/spdmlib/src/responder/psk_finish_rsp.rs b/spdmlib/src/responder/psk_finish_rsp.rs
+index 1d34b27..1d17b03 100644
+--- a/spdmlib/src/responder/psk_finish_rsp.rs
++++ b/spdmlib/src/responder/psk_finish_rsp.rs
+@@ -4,20 +4,22 @@
+ 
+ use crate::common::SpdmCodec;
+ use crate::common::INVALID_SLOT;
+-use crate::error::SpdmResult;
+-use crate::error::SPDM_STATUS_CRYPTO_ERROR;
+-use crate::error::SPDM_STATUS_INVALID_MSG_FIELD;
+-use crate::error::SPDM_STATUS_INVALID_STATE_LOCAL;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::message::*;
+ use crate::responder::*;
+ 
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
++
+ impl ResponderContext {
+-    pub async fn handle_spdm_psk_finish(&mut self, session_id: u32, bytes: &[u8]) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_psk_finish_response(session_id, bytes, &mut writer)?;
+-        self.send_message(Some(session_id), writer.used_slice(), false)
+-            .await
++    pub fn handle_spdm_psk_finish(
++        &mut self,
++        session_id: u32,
++        bytes: &[u8],
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_psk_finish_response(session_id, bytes, &mut writer)
+     }
+ 
+     // Return true on success, false otherwise
+@@ -26,17 +28,17 @@ impl ResponderContext {
+         session_id: u32,
+         bytes: &[u8],
+         writer: &mut Writer,
+-    ) -> SpdmResult {
++    ) -> Reply {
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++            return SendIt(writer.used());
+         }
+ 
+         self.common.reset_buffer_via_request_code(
+@@ -51,7 +53,7 @@ impl ResponderContext {
+         } else {
+             error!("!!! psk_finish req : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++            return SendIt(writer.used());
+         }
+         // Safety to call unwrap()
+         let psk_finish_req = psk_finish_req.unwrap();
+@@ -70,7 +72,7 @@ impl ResponderContext {
+ 
+             if !session.get_use_psk() {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-                return Err(SPDM_STATUS_INVALID_MSG_FIELD);
++                return SendIt(writer.used());
+             }
+ 
+             if self
+@@ -80,7 +82,7 @@ impl ResponderContext {
+             {
+                 error!("message_f add the message error");
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+ 
+             let session = self
+@@ -93,7 +95,7 @@ impl ResponderContext {
+                     .calc_rsp_transcript_hash(true, INVALID_SLOT, false, session);
+             if transcript_hash.is_err() {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+             let transcript_hash = transcript_hash.as_ref().unwrap();
+ 
+@@ -108,7 +110,7 @@ impl ResponderContext {
+             if res.is_err() {
+                 error!("verify_hmac_with_request_finished_key fail");
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorDecryptError, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             } else {
+                 info!("verify_hmac_with_request_finished_key pass");
+             }
+@@ -120,7 +122,7 @@ impl ResponderContext {
+             {
+                 error!("message_f add the message error");
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-                return Err(SPDM_STATUS_CRYPTO_ERROR);
++                return SendIt(writer.used());
+             }
+         }
+ 
+@@ -137,7 +139,7 @@ impl ResponderContext {
+         let res = response.spdm_encode(&mut self.common, writer);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_INVALID_STATE_LOCAL);
++            return SendIt(writer.used());
+         }
+ 
+         if self
+@@ -147,7 +149,7 @@ impl ResponderContext {
+         {
+             error!("message_f add the message error");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+ 
+         let session = self
+@@ -160,13 +162,20 @@ impl ResponderContext {
+             .calc_rsp_transcript_hash(true, 0, false, session);
+         if th2.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return Err(SPDM_STATUS_CRYPTO_ERROR);
++            return SendIt(writer.used());
+         }
+         // Safely to call unwrap;
+         let th2 = th2.unwrap();
+         debug!("!!! th2 : {:02x?}\n", th2.as_ref());
+         let spdm_version_sel = self.common.negotiate_info.spdm_version_sel;
+         let session = self.common.get_session_via_id(session_id).unwrap();
+-        session.generate_data_secret(spdm_version_sel, &th2)
++        if session
++            .generate_data_secret(spdm_version_sel, &th2)
++            .is_err()
++        {
++            self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
++        }
++
++        SendIt(writer.used())
+     }
+ }
+diff --git a/spdmlib/src/responder/vendor_rsp.rs b/spdmlib/src/responder/vendor_rsp.rs
+index 0ce2a43..aeed9b3 100644
+--- a/spdmlib/src/responder/vendor_rsp.rs
++++ b/spdmlib/src/responder/vendor_rsp.rs
+@@ -3,21 +3,23 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ use crate::common::SpdmCodec;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::error::SpdmResult;
+ use crate::message::*;
+ use crate::responder::*;
+ 
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
++
+ impl ResponderContext {
+-    pub async fn handle_spdm_vendor_defined_request(
++    pub fn handle_spdm_vendor_defined_request(
+         &mut self,
+         session_id: Option<u32>,
+         bytes: &[u8],
+-    ) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_vendor_defined_response(session_id, bytes, &mut writer);
+-        self.send_message(session_id, writer.used_slice(), false)
+-            .await
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_vendor_defined_response(session_id, bytes, &mut writer)
+     }
+ 
+     pub fn write_spdm_vendor_defined_response(
+@@ -25,17 +27,17 @@ impl ResponderContext {
+         session_id: Option<u32>,
+         bytes: &[u8],
+         writer: &mut Writer,
+-    ) {
++    ) -> Reply {
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != self.common.negotiate_info.spdm_version_sel {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         self.common.reset_buffer_via_request_code(
+@@ -47,7 +49,7 @@ impl ResponderContext {
+             SpdmVendorDefinedRequestPayload::spdm_read(&mut self.common, &mut reader);
+         if vendor_defined_request_payload.is_none() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         let vendor_defined_request_payload = vendor_defined_request_payload.unwrap();
+ 
+@@ -58,7 +60,7 @@ impl ResponderContext {
+             self.respond_to_vendor_defined_request(&req_payload, vendor_defined_request_handler);
+         if rsp_payload.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         let rsp_payload = rsp_payload.unwrap();
+@@ -80,6 +82,8 @@ impl ResponderContext {
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+         }
++
++        SendIt(writer.used())
+     }
+ 
+     pub fn respond_to_vendor_defined_request<F>(
+diff --git a/spdmlib/src/responder/version_rsp.rs b/spdmlib/src/responder/version_rsp.rs
+index 1d58d7f..ded8419 100644
+--- a/spdmlib/src/responder/version_rsp.rs
++++ b/spdmlib/src/responder/version_rsp.rs
+@@ -3,30 +3,35 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ use crate::common::SpdmCodec;
+-use crate::error::SpdmResult;
++use crate::config::MAX_SPDM_MSG_SIZE;
+ use crate::message::*;
+ use crate::protocol::*;
+ use crate::responder::*;
+ 
++use super::context::Reply;
++use crate::responder::context::Reply::SendIt;
++
+ impl ResponderContext {
+-    pub async fn handle_spdm_version(&mut self, bytes: &[u8]) -> SpdmResult {
+-        let mut send_buffer = [0u8; config::MAX_SPDM_MSG_SIZE];
+-        let mut writer = Writer::init(&mut send_buffer);
+-        self.write_spdm_version_response(bytes, &mut writer);
+-        self.send_message(None, writer.used_slice(), false).await
++    pub fn handle_spdm_version(
++        &mut self,
++        bytes: &[u8],
++        response_buffer: &mut [u8; MAX_SPDM_MSG_SIZE],
++    ) -> Reply {
++        let mut writer = Writer::init(response_buffer);
++        self.write_spdm_version_response(bytes, &mut writer)
+     }
+ 
+-    pub fn write_spdm_version_response(&mut self, bytes: &[u8], writer: &mut Writer) {
++    pub fn write_spdm_version_response(&mut self, bytes: &[u8], writer: &mut Writer) -> Reply {
+         let mut reader = Reader::init(bytes);
+         let message_header = SpdmMessageHeader::read(&mut reader);
+         if let Some(message_header) = message_header {
+             if message_header.version != SpdmVersion::SpdmVersion10 {
+                 self.write_spdm_error(SpdmErrorCode::SpdmErrorVersionMismatch, 0, writer);
+-                return;
++                return SendIt(writer.used());
+             }
+         } else {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         self.common
+@@ -38,7 +43,7 @@ impl ResponderContext {
+         } else {
+             error!("!!! get_version : fail !!!\n");
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         // clear cache data
+@@ -50,7 +55,7 @@ impl ResponderContext {
+             .is_err()
+         {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+ 
+         info!("send spdm version\n");
+@@ -81,10 +86,12 @@ impl ResponderContext {
+         let res = response.spdm_encode(&mut self.common, writer);
+         if res.is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+-            return;
++            return SendIt(writer.used());
+         }
+         if self.common.append_message_a(writer.used_slice()).is_err() {
+             self.write_spdm_error(SpdmErrorCode::SpdmErrorUnspecified, 0, writer);
+         }
++
++        SendIt(writer.used())
+     }
+ }
+diff --git a/test/spdmlib-test/src/requester_tests/context.rs b/test/spdmlib-test/src/requester_tests/context.rs
+index b56978d..40dda60 100644
+--- a/test/spdmlib-test/src/requester_tests/context.rs
++++ b/test/spdmlib-test/src/requester_tests/context.rs
+@@ -104,117 +104,128 @@ fn test_case0_start_session() {
+ 
+ #[test]
+ fn test_case0_get_next_half_session() {
+-    let future = async {
+-        let (rsp_config_info, rsp_provision_info) = create_info();
+-        let (req_config_info, req_provision_info) = create_info();
+-
+-        let shared_buffer = SharedBuffer::new();
+-        let device_io_responder = Arc::new(Mutex::new(FakeSpdmDeviceIoReceve::new(Arc::new(
+-            shared_buffer,
+-        ))));
+-        let pcidoe_transport_encap = Arc::new(Mutex::new(PciDoeTransportEncap {}));
+-
+-        secret::asym_sign::register(SECRET_ASYM_IMPL_INSTANCE.clone());
+-        secret::measurement::register(SECRET_MEASUREMENT_IMPL_INSTANCE.clone());
+-        secret::psk::register(SECRET_PSK_IMPL_INSTANCE.clone());
+-
+-        let responder = responder::ResponderContext::new(
+-            device_io_responder,
+-            pcidoe_transport_encap,
+-            rsp_config_info,
+-            rsp_provision_info,
+-        );
+-
+-        let pcidoe_transport_encap2 = Arc::new(Mutex::new(PciDoeTransportEncap {}));
+-        let shared_buffer = SharedBuffer::new();
+-        let device_io_requester = Arc::new(Mutex::new(FakeSpdmDeviceIo::new(
+-            Arc::new(shared_buffer),
+-            Arc::new(Mutex::new(responder)),
+-        )));
+-
+-        let mut requester = RequesterContext::new(
+-            device_io_requester,
+-            pcidoe_transport_encap2,
+-            req_config_info,
+-            req_provision_info,
+-        );
+-
+-        let status = requester.init_connection().await.is_ok();
+-        assert!(status);
+-
+-        let status = requester.send_receive_spdm_digest(None).await.is_ok();
+-        assert!(status);
+-
+-        let status = requester
+-            .send_receive_spdm_certificate(None, 0)
+-            .await
+-            .is_ok();
+-        assert!(status);
+-
+-        #[cfg(feature = "mut-auth")]
+-        {
+-            requester.common.negotiate_info.req_asym_sel =
+-                SpdmReqAsymAlgo::TPM_ALG_ECDSA_ECC_NIST_P384;
+-        }
+-
+-        let result = requester
+-            .start_session(
+-                false,
+-                0,
+-                SpdmMeasurementSummaryHashType::SpdmMeasurementSummaryHashTypeAll,
+-            )
+-            .await;
+-        assert_eq!(result.unwrap(), 0xfffdfffd);
+-
+-        let result = requester
+-            .start_session(
+-                false,
+-                0,
+-                SpdmMeasurementSummaryHashType::SpdmMeasurementSummaryHashTypeAll,
+-            )
+-            .await;
+-        assert_eq!(result.unwrap(), 0xfffcfffc);
+-
+-        let result = requester
+-            .start_session(
+-                false,
+-                0,
+-                SpdmMeasurementSummaryHashType::SpdmMeasurementSummaryHashTypeAll,
+-            )
+-            .await;
+-        assert_eq!(result.unwrap(), 0xfffbfffb);
+-
+-        let result = requester
+-            .start_session(
+-                true,
+-                0,
+-                SpdmMeasurementSummaryHashType::SpdmMeasurementSummaryHashTypeAll,
+-            )
+-            .await;
+-        assert_eq!(result.unwrap(), 0xfffafffa);
++    fn inner() {
++        let future = async {
++            let (rsp_config_info, rsp_provision_info) = create_info();
++            let (req_config_info, req_provision_info) = create_info();
++
++            let shared_buffer = SharedBuffer::new();
++            let device_io_responder = Arc::new(Mutex::new(FakeSpdmDeviceIoReceve::new(Arc::new(
++                shared_buffer,
++            ))));
++            let pcidoe_transport_encap = Arc::new(Mutex::new(PciDoeTransportEncap {}));
++
++            secret::asym_sign::register(SECRET_ASYM_IMPL_INSTANCE.clone());
++            secret::measurement::register(SECRET_MEASUREMENT_IMPL_INSTANCE.clone());
++            secret::psk::register(SECRET_PSK_IMPL_INSTANCE.clone());
++
++            let responder = responder::ResponderContext::new(
++                device_io_responder,
++                pcidoe_transport_encap,
++                rsp_config_info,
++                rsp_provision_info,
++            );
++
++            let pcidoe_transport_encap2 = Arc::new(Mutex::new(PciDoeTransportEncap {}));
++            let shared_buffer = SharedBuffer::new();
++            let device_io_requester = Arc::new(Mutex::new(FakeSpdmDeviceIo::new(
++                Arc::new(shared_buffer),
++                Arc::new(Mutex::new(responder)),
++            )));
++
++            let mut requester = RequesterContext::new(
++                device_io_requester,
++                pcidoe_transport_encap2,
++                req_config_info,
++                req_provision_info,
++            );
++
++            let status = requester.init_connection().await.is_ok();
++            assert!(status);
++
++            let status = requester.send_receive_spdm_digest(None).await.is_ok();
++            assert!(status);
++
++            let status = requester
++                .send_receive_spdm_certificate(None, 0)
++                .await
++                .is_ok();
++            assert!(status);
++
++            #[cfg(feature = "mut-auth")]
++            {
++                requester.common.negotiate_info.req_asym_sel =
++                    SpdmReqAsymAlgo::TPM_ALG_ECDSA_ECC_NIST_P384;
++            }
++
++            let result = requester
++                .start_session(
++                    false,
++                    0,
++                    SpdmMeasurementSummaryHashType::SpdmMeasurementSummaryHashTypeAll,
++                )
++                .await;
++            assert_eq!(result.unwrap(), 0xfffdfffd);
++
++            let result = requester
++                .start_session(
++                    false,
++                    0,
++                    SpdmMeasurementSummaryHashType::SpdmMeasurementSummaryHashTypeAll,
++                )
++                .await;
++            assert_eq!(result.unwrap(), 0xfffcfffc);
++
++            let result = requester
++                .start_session(
++                    false,
++                    0,
++                    SpdmMeasurementSummaryHashType::SpdmMeasurementSummaryHashTypeAll,
++                )
++                .await;
++            assert_eq!(result.unwrap(), 0xfffbfffb);
++
++            let result = requester
++                .start_session(
++                    true,
++                    0,
++                    SpdmMeasurementSummaryHashType::SpdmMeasurementSummaryHashTypeAll,
++                )
++                .await;
++            assert_eq!(result.unwrap(), 0xfffafffa);
++
++            let result = requester.end_session(0xfffbfffb).await;
++            assert!(result.is_ok());
++
++            let result = requester
++                .start_session(
++                    false,
++                    0,
++                    SpdmMeasurementSummaryHashType::SpdmMeasurementSummaryHashTypeAll,
++                )
++                .await;
++            assert_eq!(result.unwrap(), 0xfffbfffb);
++
++            let result = requester
++                .start_session(
++                    false,
++                    0,
++                    SpdmMeasurementSummaryHashType::SpdmMeasurementSummaryHashTypeAll,
++                )
++                .await;
++            assert!(result.is_err());
++        };
++        executor::block_on(future);
++    }
+ 
+-        let result = requester.end_session(0xfffbfffb).await;
+-        assert!(result.is_ok());
++    use std::thread;
+ 
+-        let result = requester
+-            .start_session(
+-                false,
+-                0,
+-                SpdmMeasurementSummaryHashType::SpdmMeasurementSummaryHashTypeAll,
+-            )
+-            .await;
+-        assert_eq!(result.unwrap(), 0xfffbfffb);
+-
+-        let result = requester
+-            .start_session(
+-                false,
+-                0,
+-                SpdmMeasurementSummaryHashType::SpdmMeasurementSummaryHashTypeAll,
+-            )
+-            .await;
+-        assert!(result.is_err());
+-    };
+-    executor::block_on(future);
++    thread::Builder::new()
++        .stack_size(10 * 1024 * 1024)
++        .spawn(inner)
++        .unwrap()
++        .join()
++        .unwrap();
+ }
+ 
+ #[test]
+diff --git a/test/spdmlib-test/src/responder_tests/algorithm_rsp.rs b/test/spdmlib-test/src/responder_tests/algorithm_rsp.rs
+index a91f009..c2aaff6 100644
+--- a/test/spdmlib-test/src/responder_tests/algorithm_rsp.rs
++++ b/test/spdmlib-test/src/responder_tests/algorithm_rsp.rs
+@@ -9,6 +9,7 @@ use crate::common::util::create_info;
+ use codec::{Codec, Reader, Writer};
+ use log::debug;
+ use spdmlib::common::*;
++use spdmlib::config::MAX_SPDM_MSG_SIZE;
+ use spdmlib::message::*;
+ use spdmlib::protocol::*;
+ use spdmlib::{responder, secret};
+@@ -87,7 +88,8 @@ fn test_case0_handle_spdm_algorithm() {
+         bytes.copy_from_slice(&spdm_message_header[0..]);
+         bytes[2..].copy_from_slice(&negotiate_algorithms[0..1022]);
+ 
+-        context.handle_spdm_algorithm(bytes).await;
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
++        context.handle_spdm_algorithm(bytes, &mut response_buffer);
+ 
+         let data = context.common.runtime_info.message_a.as_ref();
+         let u8_slice = &mut [0u8; 2048];
+diff --git a/test/spdmlib-test/src/responder_tests/capability_rsp.rs b/test/spdmlib-test/src/responder_tests/capability_rsp.rs
+index fe0470e..597c732 100644
+--- a/test/spdmlib-test/src/responder_tests/capability_rsp.rs
++++ b/test/spdmlib-test/src/responder_tests/capability_rsp.rs
+@@ -8,6 +8,7 @@ use crate::common::transport::PciDoeTransportEncap;
+ use crate::common::util::create_info;
+ use codec::{Codec, Reader, Writer};
+ use spdmlib::common::*;
++use spdmlib::config::MAX_SPDM_MSG_SIZE;
+ use spdmlib::message::*;
+ use spdmlib::protocol::*;
+ use spdmlib::{responder, secret};
+@@ -56,7 +57,8 @@ fn test_case0_handle_spdm_capability() {
+         let bytes = &mut [0u8; 1024];
+         bytes.copy_from_slice(&spdm_message_header[0..]);
+         bytes[2..].copy_from_slice(&capabilities[0..1022]);
+-        context.handle_spdm_capability(bytes).await;
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
++        context.handle_spdm_capability(bytes, &mut response_buffer);
+ 
+         let rsp_capabilities = SpdmResponseCapabilityFlags::CERT_CAP
+             | SpdmResponseCapabilityFlags::CHAL_CAP
+diff --git a/test/spdmlib-test/src/responder_tests/certificate_rsp.rs b/test/spdmlib-test/src/responder_tests/certificate_rsp.rs
+index f9d5a0b..f146a02 100644
+--- a/test/spdmlib-test/src/responder_tests/certificate_rsp.rs
++++ b/test/spdmlib-test/src/responder_tests/certificate_rsp.rs
+@@ -18,6 +18,8 @@ use alloc::sync::Arc;
+ #[test]
+ #[cfg(feature = "hashed-transcript-data")]
+ fn test_case0_handle_spdm_certificate() {
++    use spdmlib::config::MAX_SPDM_MSG_SIZE;
++
+     let future = async {
+         let (config_info, provision_info) = create_info();
+         let pcidoe_transport_encap = Arc::new(Mutex::new(PciDoeTransportEncap {}));
+@@ -67,7 +69,8 @@ fn test_case0_handle_spdm_certificate() {
+         let bytes = &mut [0u8; 1024];
+         bytes.copy_from_slice(&spdm_message_header[0..]);
+         bytes[2..].copy_from_slice(&capabilities[0..1022]);
+-        context.handle_spdm_certificate(bytes, None).await;
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
++        context.handle_spdm_certificate(bytes, None, &mut response_buffer);
+ 
+         #[cfg(not(feature = "hashed-transcript-data"))]
+         {
+diff --git a/test/spdmlib-test/src/responder_tests/challenge_rsp.rs b/test/spdmlib-test/src/responder_tests/challenge_rsp.rs
+index 20449c8..6eddcaa 100644
+--- a/test/spdmlib-test/src/responder_tests/challenge_rsp.rs
++++ b/test/spdmlib-test/src/responder_tests/challenge_rsp.rs
+@@ -22,6 +22,8 @@ use alloc::sync::Arc;
+ #[test]
+ #[cfg(feature = "hashed-transcript-data")]
+ fn test_case0_handle_spdm_challenge() {
++    use spdmlib::config::MAX_SPDM_MSG_SIZE;
++
+     let future = async {
+         let (config_info, provision_info) = create_info();
+         let pcidoe_transport_encap = Arc::new(Mutex::new(PciDoeTransportEncap {}));
+@@ -82,7 +84,9 @@ fn test_case0_handle_spdm_challenge() {
+         let bytes = &mut [0u8; 4 + SPDM_NONCE_SIZE];
+         bytes[0..2].copy_from_slice(&spdm_message_header[0..]);
+         bytes[2..4 + SPDM_NONCE_SIZE].copy_from_slice(&challenge[0..2 + SPDM_NONCE_SIZE]);
+-        context.handle_spdm_challenge(bytes).await;
++
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
++        context.handle_spdm_challenge(bytes, &mut response_buffer);
+ 
+         #[cfg(not(feature = "hashed-transcript-data"))]
+         {
+diff --git a/test/spdmlib-test/src/responder_tests/digest_rsp.rs b/test/spdmlib-test/src/responder_tests/digest_rsp.rs
+index e83529a..a484e94 100644
+--- a/test/spdmlib-test/src/responder_tests/digest_rsp.rs
++++ b/test/spdmlib-test/src/responder_tests/digest_rsp.rs
+@@ -17,6 +17,8 @@ use alloc::sync::Arc;
+ #[test]
+ #[cfg(feature = "hashed-transcript-data")]
+ fn test_case0_handle_spdm_digest() {
++    use spdmlib::config::MAX_SPDM_MSG_SIZE;
++
+     let future = async {
+         let (config_info, provision_info) = create_info();
+         let pcidoe_transport_encap = Arc::new(Mutex::new(PciDoeTransportEncap {}));
+@@ -57,7 +59,8 @@ fn test_case0_handle_spdm_digest() {
+         assert!(value.encode(&mut writer).is_ok());
+ 
+         let bytes = &mut [0u8; 1024];
+-        context.handle_spdm_digest(bytes, None).await;
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
++        context.handle_spdm_digest(bytes, None, &mut response_buffer);
+     };
+     executor::block_on(future);
+ }
+diff --git a/test/spdmlib-test/src/responder_tests/encap_rsp.rs b/test/spdmlib-test/src/responder_tests/encap_rsp.rs
+index df46b6f..01b8b87 100644
+--- a/test/spdmlib-test/src/responder_tests/encap_rsp.rs
++++ b/test/spdmlib-test/src/responder_tests/encap_rsp.rs
+@@ -56,10 +56,10 @@ fn test_handle_get_encapsulated_request() {
+             .spdm_encode(&mut context.common, &mut writer)
+             .is_ok());
+ 
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
+         assert!(context
+-            .handle_get_encapsulated_request(SESSION_ID, writer.used_slice())
+-            .await
+-            .is_ok());
++            .handle_get_encapsulated_request(writer.used_slice(), &mut response_buffer)
++            .is_sendit());
+ 
+         let receive = &mut [0u8; config::RECEIVER_BUFFER_SIZE];
+         let receive_size = {
+@@ -136,10 +136,10 @@ fn test_handle_deliver_encapsulated_reponse_digest() {
+ 
+         assert!(write_spdm_get_digest_response(&mut context, &mut writer).is_ok());
+ 
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
+         assert!(context
+-            .handle_deliver_encapsulated_reponse(SESSION_ID, request)
+-            .await
+-            .is_ok());
++            .handle_deliver_encapsulated_reponse(request, &mut response_buffer)
++            .is_sendit());
+ 
+         // Get data sent by responder and decode the secured message
+         let receive = &mut [0u8; config::RECEIVER_BUFFER_SIZE];
+@@ -221,10 +221,10 @@ fn test_handle_deliver_encapsulated_reponse_cert() {
+ 
+         assert!(write_spdm_get_certificate_response(&mut context, &mut writer).is_ok());
+ 
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
+         assert!(context
+-            .handle_deliver_encapsulated_reponse(SESSION_ID, request)
+-            .await
+-            .is_ok());
++            .handle_deliver_encapsulated_reponse(request, &mut response_buffer)
++            .is_sendit());
+ 
+         let receive: &mut [u8] = &mut [0u8; config::RECEIVER_BUFFER_SIZE];
+         let receive_size = {
+diff --git a/test/spdmlib-test/src/responder_tests/end_session_rsp.rs b/test/spdmlib-test/src/responder_tests/end_session_rsp.rs
+index 7c805ad..9593d08 100644
+--- a/test/spdmlib-test/src/responder_tests/end_session_rsp.rs
++++ b/test/spdmlib-test/src/responder_tests/end_session_rsp.rs
+@@ -9,6 +9,7 @@ use crate::common::util::create_info;
+ use codec::{Codec, Writer};
+ use spdmlib::common::session::{SpdmSession, SpdmSessionState};
+ use spdmlib::common::SpdmCodec;
++use spdmlib::config::MAX_SPDM_MSG_SIZE;
+ use spdmlib::message::*;
+ use spdmlib::protocol::*;
+ use spdmlib::{responder, secret};
+@@ -92,10 +93,11 @@ fn test_case0_handle_spdm_end_session() {
+         let bytes = &mut [0u8; 1024];
+         bytes.copy_from_slice(&spdm_message_header[0..]);
+         bytes[2..].copy_from_slice(&session_request[0..1022]);
++
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
+         assert!(context
+-            .handle_spdm_end_session(session_id, bytes)
+-            .await
+-            .is_ok());
++            .handle_spdm_end_session(session_id, bytes, &mut response_buffer)
++            .is_sendit());
+     };
+     executor::block_on(future);
+ }
+diff --git a/test/spdmlib-test/src/responder_tests/error_rsp.rs b/test/spdmlib-test/src/responder_tests/error_rsp.rs
+deleted file mode 100644
+index 5a793d6..0000000
+--- a/test/spdmlib-test/src/responder_tests/error_rsp.rs
++++ /dev/null
+@@ -1,40 +0,0 @@
+-// Copyright (c) 2020 Intel Corporation
+-//
+-// SPDX-License-Identifier: Apache-2.0
+-
+-use crate::common::device_io::{FakeSpdmDeviceIoReceve, SharedBuffer};
+-use crate::common::secret_callback::*;
+-use crate::common::transport::PciDoeTransportEncap;
+-use crate::common::util::create_info;
+-use spdmlib::message::*;
+-use spdmlib::protocol::*;
+-use spdmlib::{responder, secret};
+-use spin::Mutex;
+-extern crate alloc;
+-use alloc::sync::Arc;
+-
+-#[test]
+-fn test_case0_send_spdm_error() {
+-    let (config_info, provision_info) = create_info();
+-    let pcidoe_transport_encap = Arc::new(Mutex::new(PciDoeTransportEncap {}));
+-    let shared_buffer = SharedBuffer::new();
+-    let socket_io_transport = Arc::new(Mutex::new(FakeSpdmDeviceIoReceve::new(Arc::new(
+-        shared_buffer,
+-    ))));
+-    secret::asym_sign::register(SECRET_ASYM_IMPL_INSTANCE.clone());
+-    let future = async move {
+-        let mut context = responder::ResponderContext::new(
+-            socket_io_transport,
+-            pcidoe_transport_encap,
+-            config_info,
+-            provision_info,
+-        );
+-
+-        context.common.negotiate_info.base_hash_sel = SpdmBaseHashAlgo::TPM_ALG_SHA_384;
+-        context
+-            .send_spdm_error(SpdmErrorCode::SpdmErrorInvalidRequest, 0)
+-            .await
+-    };
+-
+-    executor::block_on(future);
+-}
+diff --git a/test/spdmlib-test/src/responder_tests/finish_rsp.rs b/test/spdmlib-test/src/responder_tests/finish_rsp.rs
+index 787e2ae..71f70e8 100644
+--- a/test/spdmlib-test/src/responder_tests/finish_rsp.rs
++++ b/test/spdmlib-test/src/responder_tests/finish_rsp.rs
+@@ -96,6 +96,8 @@ fn test_case0_handle_spdm_finish() {
+ #[test]
+ #[cfg(feature = "hashed-transcript-data")]
+ fn test_case1_handle_spdm_finish() {
++    use spdmlib::config::MAX_SPDM_MSG_SIZE;
++
+     let (config_info, provision_info) = create_info();
+     let pcidoe_transport_encap = Arc::new(Mutex::new(PciDoeTransportEncap {}));
+     let shared_buffer = SharedBuffer::new();
+@@ -167,5 +169,6 @@ fn test_case1_handle_spdm_finish() {
+     let bytes = &mut [0u8; 1024];
+     bytes.copy_from_slice(&spdm_message_header[0..]);
+     bytes[2..].copy_from_slice(&finish_slic[0..1022]);
+-    context.handle_spdm_finish(4294901758, bytes);
++    let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
++    context.handle_spdm_finish(4294901758, bytes, &mut response_buffer);
+ }
+diff --git a/test/spdmlib-test/src/responder_tests/heartbeat_rsp.rs b/test/spdmlib-test/src/responder_tests/heartbeat_rsp.rs
+index 318e564..e2de4a9 100644
+--- a/test/spdmlib-test/src/responder_tests/heartbeat_rsp.rs
++++ b/test/spdmlib-test/src/responder_tests/heartbeat_rsp.rs
+@@ -8,6 +8,7 @@ use crate::common::transport::PciDoeTransportEncap;
+ use crate::common::util::create_info;
+ use codec::{Codec, Writer};
+ use spdmlib::common::session::{SpdmSession, SpdmSessionState};
++use spdmlib::config::MAX_SPDM_MSG_SIZE;
+ use spdmlib::message::*;
+ use spdmlib::protocol::*;
+ use spdmlib::{responder, secret};
+@@ -80,10 +81,10 @@ fn test_case0_handle_spdm_heartbeat() {
+         };
+         assert!(value.encode(&mut writer).is_ok());
+ 
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
+         assert!(context
+-            .handle_spdm_heartbeat(session_id, bytes)
+-            .await
+-            .is_ok());
++            .handle_spdm_heartbeat(session_id, bytes, &mut response_buffer)
++            .is_sendit());
+     };
+     executor::block_on(future);
+ }
+diff --git a/test/spdmlib-test/src/responder_tests/key_update_rsp.rs b/test/spdmlib-test/src/responder_tests/key_update_rsp.rs
+index aa24b13..d9121ed 100644
+--- a/test/spdmlib-test/src/responder_tests/key_update_rsp.rs
++++ b/test/spdmlib-test/src/responder_tests/key_update_rsp.rs
+@@ -9,6 +9,7 @@ use crate::common::util::create_info;
+ use codec::{Codec, Writer};
+ use spdmlib::common::session::{SpdmSession, SpdmSessionState};
+ use spdmlib::common::SpdmCodec;
++use spdmlib::config::MAX_SPDM_MSG_SIZE;
+ use spdmlib::message::*;
+ use spdmlib::protocol::*;
+ use spdmlib::{responder, secret};
+@@ -86,7 +87,8 @@ fn test_case0_handle_spdm_key_update() {
+         bytes.copy_from_slice(&spdm_message_header[0..]);
+         bytes[2..].copy_from_slice(&key_exchange[0..1022]);
+ 
+-        context.handle_spdm_key_update(session_id, bytes).await;
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
++        context.handle_spdm_key_update(session_id, bytes, &mut response_buffer);
+     };
+     executor::block_on(future);
+ }
+@@ -159,7 +161,8 @@ fn test_case1_handle_spdm_key_update() {
+         bytes.copy_from_slice(&spdm_message_header[0..]);
+         bytes[2..].copy_from_slice(&key_exchange[0..1022]);
+ 
+-        context.handle_spdm_key_update(session_id, bytes).await;
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
++        context.handle_spdm_key_update(session_id, bytes, &mut response_buffer);
+     };
+     executor::block_on(future);
+ }
+diff --git a/test/spdmlib-test/src/responder_tests/measurement_rsp.rs b/test/spdmlib-test/src/responder_tests/measurement_rsp.rs
+index a3d26ae..53dd453 100644
+--- a/test/spdmlib-test/src/responder_tests/measurement_rsp.rs
++++ b/test/spdmlib-test/src/responder_tests/measurement_rsp.rs
+@@ -9,6 +9,7 @@ use crate::common::util::create_info;
+ use codec::{Codec, Reader, Writer};
+ use spdmlib::common::SpdmCodec;
+ use spdmlib::common::SpdmConnectionState;
++use spdmlib::config::MAX_SPDM_MSG_SIZE;
+ use spdmlib::message::*;
+ use spdmlib::protocol::*;
+ use spdmlib::{responder, secret};
+@@ -70,7 +71,8 @@ fn test_case0_handle_spdm_measurement() {
+         let bytes = &mut [0u8; 1024];
+         bytes.copy_from_slice(&spdm_message_header[0..]);
+         bytes[2..].copy_from_slice(&measurements_struct[0..1022]);
+-        context.handle_spdm_measurement(None, bytes).await;
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
++        context.handle_spdm_measurement(None, bytes, &mut response_buffer);
+ 
+         #[cfg(not(feature = "hashed-transcript-data"))]
+         {
+@@ -174,7 +176,8 @@ fn test_case1_handle_spdm_measurement() {
+         let bytes = &mut [0u8; 1024];
+         bytes.copy_from_slice(&spdm_message_header[0..]);
+         bytes[2..].copy_from_slice(&measurements_struct[0..1022]);
+-        context.handle_spdm_measurement(None, bytes).await;
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
++        context.handle_spdm_measurement(None, bytes, &mut response_buffer);
+ 
+         #[cfg(not(feature = "hashed-transcript-data"))]
+         {
+diff --git a/test/spdmlib-test/src/responder_tests/mod.rs b/test/spdmlib-test/src/responder_tests/mod.rs
+index 8e4b5df..6943b30 100644
+--- a/test/spdmlib-test/src/responder_tests/mod.rs
++++ b/test/spdmlib-test/src/responder_tests/mod.rs
+@@ -30,8 +30,6 @@ mod encap_rsp;
+ 
+ mod end_session_rsp;
+ 
+-mod error_rsp;
+-
+ mod finish_rsp;
+ 
+ mod heartbeat_rsp;
+diff --git a/test/spdmlib-test/src/responder_tests/psk_exchange_rsp.rs b/test/spdmlib-test/src/responder_tests/psk_exchange_rsp.rs
+index 68a27ac..fb32a68 100644
+--- a/test/spdmlib-test/src/responder_tests/psk_exchange_rsp.rs
++++ b/test/spdmlib-test/src/responder_tests/psk_exchange_rsp.rs
+@@ -10,7 +10,7 @@ use codec::{Codec, Writer};
+ use spdmlib::common::opaque;
+ use spdmlib::common::opaque::*;
+ use spdmlib::common::SpdmCodec;
+-use spdmlib::config::{MAX_SPDM_PSK_CONTEXT_SIZE, MAX_SPDM_PSK_HINT_SIZE};
++use spdmlib::config::{MAX_SPDM_MSG_SIZE, MAX_SPDM_PSK_CONTEXT_SIZE, MAX_SPDM_PSK_HINT_SIZE};
+ use spdmlib::message::*;
+ use spdmlib::protocol::*;
+ use spdmlib::{responder, secret};
+@@ -75,7 +75,8 @@ fn test_case0_handle_spdm_psk_exchange() {
+         let bytes = &mut [0u8; 1024];
+         bytes.copy_from_slice(&spdm_message_header[0..]);
+         bytes[2..].copy_from_slice(&challenge[0..1022]);
+-        context.handle_spdm_psk_exchange(bytes).await;
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
++        context.handle_spdm_psk_exchange(bytes, &mut response_buffer);
+     };
+     executor::block_on(future);
+ }
+diff --git a/test/spdmlib-test/src/responder_tests/version_rsp.rs b/test/spdmlib-test/src/responder_tests/version_rsp.rs
+index 5f77fbe..1e379dd 100644
+--- a/test/spdmlib-test/src/responder_tests/version_rsp.rs
++++ b/test/spdmlib-test/src/responder_tests/version_rsp.rs
+@@ -8,6 +8,7 @@ use crate::common::transport::PciDoeTransportEncap;
+ use crate::common::util::create_info;
+ use codec::{Codec, Reader, Writer};
+ use spdmlib::common::*;
++use spdmlib::config::MAX_SPDM_MSG_SIZE;
+ use spdmlib::message::*;
+ use spdmlib::protocol::*;
+ use spdmlib::{responder, secret};
+@@ -43,7 +44,8 @@ fn test_case0_handle_spdm_version() {
+         };
+         assert!(value.encode(&mut writer).is_ok());
+ 
+-        context.handle_spdm_version(bytes).await;
++        let mut response_buffer = [0u8; MAX_SPDM_MSG_SIZE];
++        context.handle_spdm_version(bytes, &mut response_buffer);
+ 
+         let data = context.common.runtime_info.message_a.as_ref();
+         let u8_slice = &mut [0u8; 1024];
