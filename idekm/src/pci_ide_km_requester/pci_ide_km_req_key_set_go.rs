@@ -6,11 +6,7 @@ use codec::Codec;
 use codec::Writer;
 use spdmlib::error::SPDM_STATUS_BUFFER_FULL;
 use spdmlib::error::SPDM_STATUS_INVALID_MSG_FIELD;
-use spdmlib::{
-    error::SpdmResult,
-    message::{VendorDefinedReqPayloadStruct, MAX_SPDM_VENDOR_DEFINED_PAYLOAD_SIZE},
-    requester::RequesterContext,
-};
+use spdmlib::{error::SpdmResult, requester::RequesterContext};
 
 use crate::pci_idekm::vendor_id;
 use crate::pci_idekm::KGoStopAckDataObject;
@@ -33,15 +29,13 @@ impl IdekmReqContext {
         key_sub_stream: u8,
         port_index: u8,
     ) -> SpdmResult {
-        let mut vendor_defined_req_payload_struct = VendorDefinedReqPayloadStruct {
-            req_length: 0,
-            vendor_defined_req_payload: [0u8; MAX_SPDM_VENDOR_DEFINED_PAYLOAD_SIZE],
-        };
+        let mut writer = Writer::init(
+            &mut self
+                .vendor_defined_req_payload_struct
+                .vendor_defined_req_payload,
+        );
 
-        let mut writer =
-            Writer::init(&mut vendor_defined_req_payload_struct.vendor_defined_req_payload);
-
-        vendor_defined_req_payload_struct.req_length = KSetGoDataObject {
+        self.vendor_defined_req_payload_struct.req_length = KSetGoDataObject {
             stream_id,
             key_set,
             key_direction,
@@ -52,18 +46,21 @@ impl IdekmReqContext {
         .map_err(|_| SPDM_STATUS_BUFFER_FULL)?
             as u16;
 
-        let vendor_defined_rsp_payload_struct = spdm_requester
+        spdm_requester
             .send_spdm_vendor_defined_request(
                 Some(session_id),
                 STANDARD_ID,
                 vendor_id(),
-                vendor_defined_req_payload_struct,
+                &self.vendor_defined_req_payload_struct,
+                &mut self.vendor_defined_rsp_payload_struct,
             )
             .await?;
 
         let kgo_stop_ack_data_object = KGoStopAckDataObject::read_bytes(
-            &vendor_defined_rsp_payload_struct.vendor_defined_rsp_payload
-                [..vendor_defined_rsp_payload_struct.rsp_length as usize],
+            &self
+                .vendor_defined_rsp_payload_struct
+                .vendor_defined_rsp_payload
+                [..self.vendor_defined_rsp_payload_struct.rsp_length as usize],
         )
         .ok_or(SPDM_STATUS_INVALID_MSG_FIELD)?;
 

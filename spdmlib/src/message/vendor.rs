@@ -138,6 +138,15 @@ impl Codec for VendorDefinedReqPayloadStruct {
     }
 }
 
+impl Default for VendorDefinedReqPayloadStruct {
+    fn default() -> Self {
+        Self {
+            req_length: 0,
+            vendor_defined_req_payload: [0u8; MAX_SPDM_VENDOR_DEFINED_PAYLOAD_SIZE],
+        }
+    }
+}
+
 #[derive(Debug, Clone, ZeroizeOnDrop)]
 pub struct VendorDefinedRspPayloadStruct {
     pub rsp_length: u16,
@@ -171,6 +180,15 @@ impl Codec for VendorDefinedRspPayloadStruct {
             rsp_length,
             vendor_defined_rsp_payload,
         })
+    }
+}
+
+impl Default for VendorDefinedRspPayloadStruct {
+    fn default() -> Self {
+        Self {
+            rsp_length: 0,
+            vendor_defined_rsp_payload: [0u8; MAX_SPDM_VENDOR_DEFINED_PAYLOAD_SIZE],
+        }
     }
 }
 

@@ -2,8 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0 or MIT
 
-#[derive(Debug, Default, Copy, Clone)]
-pub struct IdekmReqContext;
+#[derive(Debug, Default, Clone)]
+pub struct IdekmReqContext {
+    pub vendor_defined_req_payload_struct: spdmlib::message::VendorDefinedReqPayloadStruct,
+    pub vendor_defined_rsp_payload_struct: spdmlib::message::VendorDefinedRspPayloadStruct,
+}
 
 pub mod pci_ide_km_req_query;
 pub use pci_ide_km_req_query::*;

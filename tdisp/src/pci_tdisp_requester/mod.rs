@@ -4,6 +4,12 @@
 
 use crate::pci_tdisp::{InterfaceId, TdispVersion};
 
+#[derive(Debug, Default, Clone)]
+pub struct TdispReqContext {
+    pub vendor_defined_req_payload_struct: spdmlib::message::VendorDefinedReqPayloadStruct,
+    pub vendor_defined_rsp_payload_struct: spdmlib::message::VendorDefinedRspPayloadStruct,
+}
+
 pub mod pci_tdisp_req_get_tdisp_version;
 pub use pci_tdisp_req_get_tdisp_version::*;
 

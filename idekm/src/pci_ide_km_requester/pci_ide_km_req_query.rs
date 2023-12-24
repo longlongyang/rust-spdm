@@ -5,7 +5,6 @@
 use codec::{Codec, Writer};
 use spdmlib::{
     error::{SpdmResult, SPDM_STATUS_BUFFER_FULL, SPDM_STATUS_INVALID_MSG_FIELD},
-    message::{VendorDefinedReqPayloadStruct, MAX_SPDM_VENDOR_DEFINED_PAYLOAD_SIZE},
     requester::RequesterContext,
 };
 
@@ -33,31 +32,32 @@ impl IdekmReqContext {
         ide_reg_block: &mut [u32; PCI_IDE_KM_IDE_REG_BLOCK_MAX_COUNT],
         ide_reg_block_cnt: &mut usize,
     ) -> SpdmResult {
-        let mut vendor_defined_req_payload_struct = VendorDefinedReqPayloadStruct {
-            req_length: 0,
-            vendor_defined_req_payload: [0u8; MAX_SPDM_VENDOR_DEFINED_PAYLOAD_SIZE],
-        };
+        let mut writer = Writer::init(
+            &mut self
+                .vendor_defined_req_payload_struct
+                .vendor_defined_req_payload,
+        );
 
-        let mut writer =
-            Writer::init(&mut vendor_defined_req_payload_struct.vendor_defined_req_payload);
-
-        vendor_defined_req_payload_struct.req_length = QueryDataObject { port_index }
+        self.vendor_defined_req_payload_struct.req_length = QueryDataObject { port_index }
             .encode(&mut writer)
             .map_err(|_| SPDM_STATUS_BUFFER_FULL)?
             as u16;
 
-        let vendor_defined_rsp_payload_struct = spdm_requester
+        spdm_requester
             .send_spdm_vendor_defined_request(
                 Some(session_id),
                 STANDARD_ID,
                 vendor_id(),
-                vendor_defined_req_payload_struct,
+                &self.vendor_defined_req_payload_struct,
+                &mut self.vendor_defined_rsp_payload_struct,
             )
             .await?;
 
         let query_resp_data_object = QueryRespDataObject::read_bytes(
-            &vendor_defined_rsp_payload_struct.vendor_defined_rsp_payload
-                [..vendor_defined_rsp_payload_struct.rsp_length as usize],
+            &self
+                .vendor_defined_rsp_payload_struct
+                .vendor_defined_rsp_payload
+                [..self.vendor_defined_rsp_payload_struct.rsp_length as usize],
         )
         .ok_or(SPDM_STATUS_INVALID_MSG_FIELD)?;
 
